@@ -1,66 +1,75 @@
 import streamlit as st
 from cerebras.cloud.sdk import Cerebras
 
-# --- 1. إعداد الصفحة ---
-st.set_page_config(page_title="مشروعي الذكي", page_icon="🚀")
-st.title("🤖 مساعد ذكي سريع (Cerebras)")
+# 1. إعدادات الصفحة (يجب أن تكون أول سطر)
+st.set_page_config(page_title="Cerebras Chat", page_icon="⚡", layout="centered")
 
-# --- 2. إعداد الاتصال بـ Cerebras ---
-# استبدل النص أدناه بمفتاحك الحقيقي
-API_KEY = "ضع_مفتاح_CEREBRAS_هنا"
+st.title("⚡ Cerebras Fast Chat")
+st.caption("مدعوم بواسطة نموذج Llama-3.1-70b وسرعة Cerebras")
 
-# التحقق من وجود المفتاح
-if not API_KEY or API_KEY == "csk-j9hy4epdhjft3tntdvcmd99498xhd2v36w4ym8wn9vy6mhnm":
-    st.error("الرجاء وضع الـ API Key في الكود لتشغيل التطبيق.")
+# 2. القائمة الجانبية (Sidebar) لإعدادات المفتاح
+with st.sidebar:
+    st.header("الإعدادات")
+    api_key = st.text_input("أدخل مفتاح Cerebras API:", type="password")
+    st.markdown("[احصل على مفتاح مجاني من هنا](https://cloud.cerebras.ai/)")
+    
+    # زر لمسح المحادثة
+    if st.button("مسح المحادثة 🗑️"):
+        st.session_state.messages = []
+        st.rerun()
+
+# 3. التحقق من وجود المفتاح قبل البدء
+if not api_key:
+    st.info("الرجاء إدخال API Key في القائمة الجانبية للمتابعة.")
     st.stop()
 
-client = Cerebras(api_key=API_KEY)
+# إنشاء العميل باستخدام المفتاح المدخل
+client = Cerebras(api_key=api_key)
 
-# --- 3. ذاكرة المحادثة (Session State) ---
-# هذه الخطوة مهمة لكي "يتذكر" البوت سياق الحديث السابق
+# 4. إدارة ذاكرة المحادثة (Session State)
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = [{"role": "assistant", "content": "مرحباً! كيف يمكنني مساعدتك بسرعة اليوم؟"}]
 
-# --- 4. عرض الرسائل القديمة في الشاشة ---
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# 5. عرض الرسائل السابقة في الشاشة
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# --- 5. استقبال المدخلات والرد ---
-if prompt := st.chat_input("اكتب سؤالك هنا..."):
-    
-    # أ. عرض رسالة المستخدم فوراً
+# 6. معالجة المدخلات الجديدة
+if prompt := st.chat_input("اكتب رسالتك هنا..."):
+    # أ. عرض رسالة المستخدم
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    # حفظ رسالة المستخدم في الذاكرة
-    st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # ب. تجهيز الرد من الذكاء الاصطناعي
+    # ب. إرسال الطلب واستقبال الرد (Streaming)
     with st.chat_message("assistant"):
-        message_placeholder = st.empty() # مكان فارغ للنص المتدفق
+        message_placeholder = st.empty()
         full_response = ""
         
         try:
-            # إرسال الطلب مع الذاكرة الكاملة (messages)
             stream = client.chat.completions.create(
-                model="llama3.1-70b", # الموديل الذكي والسريع
+                model="llama3.1-70b",
                 messages=[
-                    {"role": "system", "content": "أنت مساعد مفيد وتتحدث العربية بوضوح."}
-                ] + st.session_state.messages, # نرسل التاريخ السابق
+                    {"role": "system", "content": "أنت مساعد ذكي ومفيد."}
+                ] + [
+                    {"role": m["role"], "content": m["content"]} 
+                    for m in st.session_state.messages
+                ],
                 stream=True,
             )
             
-            # استقبال الرد كلمة بكلمة (Streaming)
+            # بناء الرد كلمة بكلمة
             for chunk in stream:
                 if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    full_response += content
-                    message_placeholder.markdown(full_response + "▌") # تأثير المؤشر
+                    full_response += chunk.choices[0].delta.content
+                    message_placeholder.markdown(full_response + "▌")
             
             message_placeholder.markdown(full_response)
-            
-            # حفظ رد البوت في الذاكرة
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
-            
+        
         except Exception as e:
             st.error(f"حدث خطأ: {e}")
+            full_response = "عذراً، حدث خطأ في الاتصال."
+
+    # ج. حفظ رد المساعد في الذاكرة
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
