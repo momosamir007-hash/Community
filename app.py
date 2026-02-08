@@ -3,64 +3,51 @@ import requests
 import json
 
 # --- 1. إعدادات الصفحة ---
-st.set_page_config(
-    page_title="Cerebras 6 Models",
-    page_icon="⚡",
-    layout="centered"
-)
+st.set_page_config(page_title="Cerebras Debugger", page_icon="🛠️")
 
-# تخصيص CSS لدعم العربية
+# تخصيص CSS
 st.markdown("""
 <style>
     .stChatMessage { direction: rtl; text-align: right; }
     .stTextInput > div > div > input { direction: rtl; text-align: right; }
-    p { text-align: right; }
+    .stSelectbox > div > div > div { direction: rtl; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚡ Cerebras: القوة السداسية")
+st.title("🛠️ فحص موديلات Cerebras")
 
-# --- 2. إدارة المفتاح (Secrets) ---
+# --- 2. المفتاح ---
 try:
     api_key = st.secrets["CEREBRAS_API_KEY"]
-    st.sidebar.success("✅ المفتاح متصل (Secrets)")
-except (FileNotFoundError, KeyError):
-    api_key = st.sidebar.text_input("أدخل مفتاح API:", type="password")
+except:
+    api_key = st.sidebar.text_input("API Key:", type="password")
 
 if not api_key:
-    st.warning("الرجاء توفير مفتاح API للبدء.")
+    st.warning("الرجاء إدخال المفتاح.")
     st.stop()
 
-# --- 3. القائمة الجانبية (الموديلات الـ 6) ---
+# --- 3. القائمة ---
 with st.sidebar:
-    st.header("🎛️ لوحة التحكم")
+    st.header("اختيار الموديل")
     
-    # القائمة التي تحتوي على الموديلات الستة التي ظهرت لك
-    models_list = [
-        "llama-3.3-70b",        # الأقوى والأحدث
-        "llama3.1-8b",          # السريع والخفيف
-        "qwen-3-32b",           # ممتاز في البرمجة
-        "gpt-oss-120b",         # موديل ضخم
-        "zai-glm-4.7",          # موديل متخصص
-        "qwen-3-235b-a22b-instruct-2507" # الموديل العملاق
+    # القائمة الكاملة التي ظهرت لك
+    models = [
+        "llama-3.3-70b",   # ✅ (ممتاز ومستقر)
+        "llama3.1-8b",     # ✅ (سريع جداً)
+        "qwen-3-32b",      # ❓ (جرب)
+        "gpt-oss-120b",    # ⚠️ (غالباً تجريبي)
+        "zai-glm-4.7",     # ⚠️ (قد لا يعمل)
+        "qwen-3-235b-a22b-instruct-2507" # ⚠️ (اسم معقد قد يتغير)
     ]
     
-    selected_model = st.selectbox("اختر الموديل:", models_list, index=0)
-    
-    st.info(f"الموديل الحالي: **{selected_model}**")
-    
-    system_prompt = st.text_area(
-        "تعليمات النظام:",
-        value="أنت مساعد ذكي ومفيد.",
-        height=100
-    )
+    selected_model = st.radio("اختر موديل للتجربة:", models)
     
     if st.button("🗑️ مسح الذاكرة"):
         st.session_state.messages = []
         st.rerun()
 
-# --- 4. دالة الاتصال (Streaming) ---
-def stream_chat(messages, api_key, model, system_prompt):
+# --- 4. الدالة مع كشف الأخطاء التفصيلي ---
+def stream_chat_debug(messages, api_key, model):
     url = "https://api.cerebras.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -68,51 +55,65 @@ def stream_chat(messages, api_key, model, system_prompt):
     }
     data = {
         "model": model,
-        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "messages": messages,
         "stream": True,
-        "max_tokens": 2000,
-        "temperature": 0.7
+        "max_tokens": 1000
     }
     
     try:
-        with requests.post(url, headers=headers, json=data, stream=True) as r:
-            if r.status_code != 200:
-                yield f"⚠️ خطأ: {r.text}"
-                return
-                
-            for line in r.iter_lines():
-                if line:
-                    decoded = line.decode('utf-8').replace("data: ", "")
-                    if decoded.strip() == "[DONE]": break
-                    try:
-                        chunk = json.loads(decoded)
-                        content = chunk['choices'][0]['delta'].get('content', '')
-                        if content: yield content
-                    except: continue
-    except Exception as e:
-        yield f"❌ خطأ: {e}"
+        response = requests.post(url, headers=headers, json=data, stream=True)
+        
+        # إذا كان هناك خطأ من السيرفر (ليس 200)
+        if response.status_code != 200:
+            error_details = response.text
+            try:
+                # محاولة قراءة الخطأ بصيغة JSON ليكون أوضح
+                error_json = response.json()
+                error_msg = error_json.get('error', {}).get('message', error_details)
+                yield f"⛔ **فشل الموديل:** {model}\n\n**السبب:** {error_msg}"
+            except:
+                yield f"⛔ **خطأ غير معروف:** رمز الحالة {response.status_code}\n{error_details}"
+            return
 
-# --- 5. واجهة الدردشة ---
+        # إذا نجح الاتصال، ابدأ البث
+        for line in response.iter_lines():
+            if line:
+                decoded = line.decode('utf-8').replace("data: ", "")
+                if decoded.strip() == "[DONE]": break
+                try:
+                    chunk = json.loads(decoded)
+                    content = chunk['choices'][0]['delta'].get('content', '')
+                    if content: yield content
+                except: continue
+                
+    except Exception as e:
+        yield f"❌ خطأ في الاتصال بالإنترنت: {e}"
+
+# --- 5. التشغيل ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# عرض الرسائل
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# الإدخال
-if prompt := st.chat_input("اكتب رسالتك هنا..."):
+if prompt := st.chat_input("جرب الموديل بكلمة 'مرحبا'"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        full_response = ""
-        for chunk in stream_chat(st.session_state.messages, api_key, selected_model, system_prompt):
-            full_response += chunk
-            response_placeholder.markdown(full_response + "▌")
-        response_placeholder.markdown(full_response)
-    
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+        response_holder = st.empty()
+        full_text = ""
+        
+        # استدعاء دالة الفحص
+        for chunk in stream_chat_debug(st.session_state.messages, api_key, selected_model):
+            full_text += chunk
+            response_holder.markdown(full_text + "▌")
+        
+        response_holder.markdown(full_text)
+        
+        # إذا كان الرد رسالة خطأ، لا نحفظه في الذاكرة لكي لا يفسد المحادثة التالية
+        if "⛔" not in full_text:
+            st.session_state.messages.append({"role": "assistant", "content": full_text})
+
