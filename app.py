@@ -1,5 +1,8 @@
 import streamlit as st
 from docx import Document
+from docx.shared import Pt, Inches, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_DIRECTION
 from cerebras.cloud.sdk import Cerebras
 import pandas as pd
 import json
@@ -7,15 +10,14 @@ import io
 import time
 
 # ---------------------------------------------------------
-# 1. إعداد الصفحة وتصميمها (CSS محسن للغة العربية)
+# 1. إعداد الصفحة وتصميمها (CSS عربي وعصري)
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="المحلل التربوي الذكي",
-    page_icon="🎓",
+    page_title="المساعد التربوي الشامل",
+    page_icon="📚",
     layout="wide"
 )
 
-# تصميم CSS مخصص لجعل الواجهة عصرية ودعم العربية بالكامل
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap');
@@ -27,93 +29,145 @@ st.markdown("""
     }
     
     /* تنسيق العناوين */
-    h1, h2, h3 {
-        color: #2E86C1;
-        font-weight: 700;
-    }
+    h1, h2, h3 { color: #154360; font-weight: 800; }
     
-    /* تنسيق الزر */
-    .stButton>button {
-        background-color: #2E86C1;
-        color: white;
-        border-radius: 10px;
+    /* تنسيق التبويبات */
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        background-color: #F0F3F4;
+        border-radius: 5px 5px 0 0;
+        color: #154360;
         font-weight: bold;
-        width: 100%;
-        padding: 10px;
     }
-    .stButton>button:hover {
-        background-color: #1B4F72;
+    .stTabs [aria-selected="true"] {
+        background-color: #154360;
+        color: white;
     }
 
-    /* تنسيق الجدول */
-    [data-testid="stDataFrame"] {
-        direction: rtl;
-        text-align: right;
+    /* الأزرار */
+    .stButton>button {
+        background-color: #154360;
+        color: white;
+        border-radius: 8px;
+        font-weight: bold;
+        transition: 0.3s;
     }
+    .stButton>button:hover { background-color: #1A5276; }
     
-    /* رسائل التنبيه */
-    .stSuccess, .stError, .stWarning {
-        direction: rtl;
-        border-radius: 10px;
-    }
-    
-    /* القائمة الجانبية */
-    [data-testid="stSidebar"] {
-        background-color: #F8F9F9;
-        border-left: 1px solid #ddd;
-    }
+    /* الجداول */
+    [data-testid="stDataFrame"] { direction: rtl; }
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 2. الدوال المساعدة
+# 2. بيانات التوقيت الأسبوعي (الثابتة)
+# ---------------------------------------------------------
+WEEKLY_SCHEDULE = {
+    "الأحد": [
+        {"time": "08:00 - 09:45", "activity": "تعبير شفوي"},
+        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
+        {"time": "08:00 - 09:45", "activity": "رياضيات"},
+        {"time": "10:00 - 11:15", "activity": "ت علمية"},
+        {"time": "10:00 - 11:15", "activity": "ت إسلامية"},
+        {"time": "13:00 - 15:00", "activity": "مسرح وعرائس"},
+        {"time": "13:00 - 15:00", "activity": "رسم وأشغال"},
+        {"time": "13:00 - 15:00", "activity": "ت بدنية"}
+    ],
+    "الاثنين": [
+        {"time": "08:00 - 09:45", "activity": "رياضيات"},
+        {"time": "08:00 - 09:45", "activity": "تعبير شفوي"},
+        {"time": "08:00 - 09:45", "activity": "تخطيط"},
+        {"time": "10:00 - 11:15", "activity": "ت علمية"},
+        {"time": "10:00 - 11:15", "activity": "ت مدنية"},
+        {"time": "13:00 - 15:00", "activity": "مسرح وعرائس"},
+        {"time": "13:00 - 15:00", "activity": "رسم وأشغال"},
+        {"time": "13:00 - 15:00", "activity": "ت بدنية"}
+    ],
+    "الثلاثاء": [
+        {"time": "08:00 - 09:45", "activity": "تعبير شفوي"},
+        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
+        {"time": "08:00 - 09:45", "activity": "رياضيات"},
+        {"time": "10:00 - 11:15", "activity": "ت إسلامية"},
+        {"time": "10:00 - 11:15", "activity": "ت بدنية"}
+    ],
+    "الأربعاء": [
+        {"time": "08:00 - 09:45", "activity": "رياضيات"},
+        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
+        {"time": "08:00 - 09:45", "activity": "تخطيط"},
+        {"time": "10:00 - 11:15", "activity": "ت علمية"},
+        {"time": "10:00 - 11:15", "activity": "ت مدنية"},
+        {"time": "13:00 - 15:00", "activity": "ت إيقاعية"},
+        {"time": "13:00 - 15:00", "activity": "موسيقى وإنشاد"},
+        {"time": "13:00 - 15:00", "activity": "ت بدنية"}
+    ],
+    "الخميس": [
+        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
+        {"time": "08:00 - 09:45", "activity": "رياضيات"},
+        {"time": "08:00 - 09:45", "activity": "ت علمية"},
+        {"time": "10:00 - 11:15", "activity": "ت إيقاعية"},
+        {"time": "10:00 - 11:15", "activity": "موسيقى وإنشاد"}
+    ]
+}
+
+# ---------------------------------------------------------
+# 3. الدوال المساعدة (استخراج، تحليل، Word)
 # ---------------------------------------------------------
 
+def get_domain(activity):
+    """تحديد المجال تلقائياً بناءً على النشاط"""
+    act = activity.strip()
+    if any(x in act for x in ["تعبير", "قراءة", "تخطيط", "لغة"]): return "اللغوي"
+    elif "رياضيات" in act: return "الرياضي"
+    elif any(x in act for x in ["علمية", "تكنولوجيا"]): return "العلمي"
+    elif any(x in act for x in ["إسلامية", "مدنية"]): return "الاجتماعي"
+    elif any(x in act for x in ["مسرح", "رسم", "موسيقى", "إنشاد", "تشكيلية"]): return "الفني"
+    elif any(x in act for x in ["بدنية", "إيقاعية", "رياضة"]): return "البدني والإيقاعي"
+    return ""
+
 def extract_text_from_docx(file):
-    """استخراج النصوص بذكاء مع الحفاظ على الهيكل العام"""
     doc = Document(file)
     full_text = []
-    
-    # استخراج الفقرات
     for para in doc.paragraphs:
-        if para.text.strip():
-            full_text.append(para.text)
-            
-    # استخراج الجداول (مفيد جداً في المذكرات)
+        if para.text.strip(): full_text.append(para.text)
     for table in doc.tables:
         for row in table.rows:
-            row_data = [cell.text.strip().replace("\n", " ") for cell in row.cells if cell.text.strip()]
-            if row_data:
-                full_text.append(" | ".join(row_data))
-                
+            row_text = [c.text.strip().replace("\n", " ") for c in row.cells if c.text.strip()]
+            if row_text: full_text.append(" | ".join(row_text))
     return "\n".join(full_text)
 
-def analyze_with_cerebras(text, key, model_id):
-    """تحليل النص واستخراج البيانات الهيكلية"""
+def analyze_with_cerebras(text, key, model_id, mode="journal"):
+    """
+    mode='journal': استخراج بسيط للمذكرة اليومية (نشاط، موضوع، كفاءة).
+    mode='structure': استخراج عميق للعناوين والمقاطع (المجال، الوحدة، إلخ).
+    """
     client = Cerebras(api_key=key)
     
-    system_prompt = """
-    أنت خبير تربوي ومحلل بيانات. مهمتك هي استخراج هيكلة الدروس من ملفات المذكرات التربوية.
-    
-    قم بتحليل النص واستخرج قائمة (JSON List) تحتوي على الكائنات التالية لكل نشاط تعليمي:
-    1. "المجال_أو_المقطع": (العنوان الكبير، مثل: المجال اللغوي، الحياة المدرسية، أو اسم المقطع).
-    2. "النشاط": (نوع الحصة، مثل: قراءة، رياضيات، تربية إسلامية).
-    3. "الموضوع": (عنوان الدرس الدقيق).
-    4. "الكفاءة_الختامية": (أو الكفاءة القاعدية).
-    5. "المؤشر": (مؤشر الكفاءة أو الهدف التعلمي).
-    
-    ملاحظات هامة:
-    - المخرج يجب أن يكون JSON Valid فقط بدون أي نصوص إضافية.
-    - إذا كانت المعلومة غير موجودة صراحة، حاول استنتاجها من السياق أو اكتب "غير محدد".
-    - رتب البيانات بدقة.
-    """
-    
+    if mode == "journal":
+        prompt = """
+        استخرج بيانات الدروس لملء جدول يومي.
+        المطلوب JSON List للكائنات:
+        {"النشاط": "...", "الموضوع": "...", "الكفاءة": "...", "المؤشر": "..."}
+        حاول مطابقة أسماء الأنشطة مع (رياضيات، تعبير شفوي، ت علمية، إلخ).
+        """
+    else: # mode == structure
+        prompt = """
+        قم بتحليل النص لاستخراج الهيكلة الكاملة للدروس.
+        المطلوب JSON List للكائنات:
+        1. "المجال_أو_المقطع": (العنوان الكبير، مثل: المجال اللغوي، الوحدة 3، الحياة المدرسية).
+        2. "النشاط": نوع الحصة.
+        3. "الموضوع": عنوان الدرس.
+        4. "الكفاءة_الختامية": الكفاءة.
+        5. "المؤشر": الهدف التعلمي.
+        """
+
     try:
         completion = client.chat.completions.create(
             model=model_id,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"النص المراد تحليله:\n{text[:28000]}"} # زيادة الحد المسموح قليلاً
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text[:28000]}
             ],
             temperature=0.1,
             response_format={"type": "json_object"}
@@ -122,150 +176,182 @@ def analyze_with_cerebras(text, key, model_id):
     except Exception as e:
         return {"error": str(e)}
 
-# ---------------------------------------------------------
-# 3. الواجهة الرئيسية
-# ---------------------------------------------------------
+def create_daily_journal_doc(day_name, extracted_lessons):
+    """إنشاء ملف Word للمذكرة اليومية"""
+    doc = Document()
+    
+    # إعداد الصفحة Landscape
+    section = doc.sections[0]
+    section.page_width = Inches(11.69)
+    section.page_height = Inches(8.27)
+    section.orientation = 1 
+    section.left_margin = Inches(0.5)
+    section.right_margin = Inches(0.5)
+    
+    # العنوان
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(f'المذكرة اليومية - يوم: {day_name}')
+    run.font.size = Pt(18)
+    run.font.bold = True
+    run.font.color.rgb = RGBColor(21, 67, 96) # Dark Blue
 
-# --- الشريط الجانبي ---
+    # الجدول
+    headers = ["التوقيت", "النشاط", "المجال", "الموضوع (المحتوى)", "الكفاءة", "المؤشر", "ملاحظات"]
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = 'Table Grid'
+    table.direction = WD_TABLE_DIRECTION.RTL
+    table.autofit = False 
+    
+    # تنسيق الرأس
+    widths = [0.8, 1.0, 0.9, 1.5, 1.2, 1.2, 0.8]
+    for i, header in enumerate(headers):
+        cell = table.rows[0].cells[i]
+        cell.text = header
+        cell.width = Inches(widths[i])
+        run = cell.paragraphs[0].runs[0]
+        run.font.bold = True
+        run.font.size = Pt(11)
+        
+    # تعبئة البيانات
+    day_schedule = WEEKLY_SCHEDULE.get(day_name, [])
+    
+    # معالجة البيانات المستخرجة
+    lessons_list = []
+    if isinstance(extracted_lessons, dict):
+        for val in extracted_lessons.values():
+            if isinstance(val, list): lessons_list = val; break
+        if not lessons_list: lessons_list = [extracted_lessons]
+    else: lessons_list = extracted_lessons
+
+    for slot in day_schedule:
+        row = table.add_row()
+        cells = row.cells
+        
+        # 1. التوقيت والنشاط (ثابت)
+        cells[0].text = slot['time']
+        cells[1].text = slot['activity']
+        
+        # 2. المجال (تلقائي)
+        cells[2].text = get_domain(slot['activity'])
+        
+        # 3. البحث عن الدرس (AI Data)
+        found = None
+        clean_slot = slot['activity'].replace("ت ", "").replace("مبادئ ", "").strip()
+        for lesson in lessons_list:
+            lesson_act = str(lesson.get('النشاط', '')).replace("ت ", "").replace("مبادئ ", "").strip()
+            if clean_slot in lesson_act or lesson_act in clean_slot:
+                found = lesson
+                break
+        
+        if found:
+            cells[3].text = str(found.get('الموضوع', ''))
+            cells[4].text = str(found.get('الكفاءة', '') or found.get('الكفاءة_الختامية', ''))
+            cells[5].text = str(found.get('المؤشر', ''))
+        
+        # تنسيق الخلايا
+        for i, cell in enumerate(cells):
+            cell.width = Inches(widths[i])
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                if p.runs: p.runs[0].font.name = "Arial"
+
+    return doc
+
+# ---------------------------------------------------------
+# 4. الواجهة الرئيسية
+# ---------------------------------------------------------
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/3063/3063032.png", width=80)
-    st.title("الإعدادات")
-    
-    # إدارة المفتاح
-    if "CEREBRAS_API_KEY" in st.secrets:
-        api_key = st.secrets["CEREBRAS_API_KEY"]
-        st.success("🔑 المفتاح نشط (Secrets)")
-    else:
-        api_key = st.text_input("أدخل مفتاح API (Cerebras)", type="password")
-    
-    st.markdown("---")
-    model_choice = st.selectbox("🧠 نموذج الذكاء الاصطناعي", ["llama-3.3-70b", "llama3.1-8b"])
-    st.caption("يُنصح باستخدام Llama 3.3 للدقة العالية.")
+    st.title("⚙️ الإعدادات")
+    api_key = st.secrets.get("CEREBRAS_API_KEY") or st.text_input("Cerebras API Key", type="password")
+    model_choice = st.selectbox("النموذج", ["llama-3.3-70b", "llama3.1-8b"])
+    st.info("💡 استخدم Llama 3.3 لأفضل نتائج.")
 
-# --- المحتوى الرئيسي ---
-st.title("🎓 المستخرج الآلي للمذكرات التربوية")
-st.markdown("##### ⚡ تحويل ملفات Word إلى جداول منظمة (Excel/JSON) بدقة عالية.")
+st.title("📚 المنصة التربوية الذكية")
 
-# رفع الملف
-uploaded_file = st.file_uploader("قم بسحب وإفلات ملف المذكرات (DOCX) هنا", type=["docx"])
+# --- نظام التبويبات ---
+tab1, tab2 = st.tabs(["📝 المذكرة اليومية (ملء التوقيت)", "📊 استخراج العناوين والجدول"])
 
-if uploaded_file:
-    # حاوية لعرض حالة الملف
-    file_container = st.container()
+# ==========================================
+# Tab 1: المذكرة اليومية
+# ==========================================
+with tab1:
+    st.header("إنشاء مذكرة يومية حسب التوقيت الأسبوعي")
+    col1, col2 = st.columns([2, 1])
     
-    if st.button("🚀 بدء التحليل والاستخراج"):
-        if not api_key:
-            st.error("⚠️ يرجى إدخال مفتاح API في القائمة الجانبية.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+    with col1:
+        file_tab1 = st.file_uploader("📂 ملف المذكرات (.docx)", type=["docx"], key="f1")
+    with col2:
+        day_selected = st.selectbox("📅 اختر اليوم:", list(WEEKLY_SCHEDULE.keys()))
+
+    if file_tab1 and st.button("🚀 إنشاء المذكرة", key="btn1"):
+        if not api_key: st.error("المفتاح مفقود!"); st.stop()
+        
+        with st.spinner(f'جاري تحليل الدروس ومطابقتها مع توقيت يوم {day_selected}...'):
+            text = extract_text_from_docx(file_tab1)
+            data = analyze_with_cerebras(text, api_key, model_choice, mode="journal")
             
-            try:
-                # خطوة 1: قراءة الملف
-                status_text.text("📂 جاري قراءة الملف...")
-                progress_bar.progress(25)
-                raw_text = extract_text_from_docx(uploaded_file)
+            if "error" not in data:
+                doc = create_daily_journal_doc(day_selected, data)
+                bio = io.BytesIO()
+                doc.save(bio)
                 
-                # خطوة 2: المعالجة
-                status_text.text("🤖 الذكاء الاصطناعي يقوم بتحليل البيانات...")
-                progress_bar.progress(60)
-                result = analyze_with_cerebras(raw_text, api_key, model_choice)
+                st.success("✅ تم إنشاء الملف بنجاح! تم تحديد المجالات تلقائياً.")
+                st.download_button(
+                    label=f"📥 تحميل مذكرة {day_selected} (Word)",
+                    data=bio.getvalue(),
+                    file_name=f"Journal_{day_selected}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            else:
+                st.error(f"خطأ: {data['error']}")
+
+# ==========================================
+# Tab 2: استخراج العناوين (المجال/المقطع)
+# ==========================================
+with tab2:
+    st.header("استخراج البيانات التربوية (Excel/JSON)")
+    st.markdown("استخراج: **المجال/المقطع، النشاط، الموضوع، الكفاءة** في جدول منظم.")
+    
+    file_tab2 = st.file_uploader("📂 ملف المذكرات (.docx)", type=["docx"], key="f2")
+    
+    if file_tab2 and st.button("🔍 تحليل واستخراج البيانات", key="btn2"):
+        if not api_key: st.error("المفتاح مفقود!"); st.stop()
+        
+        with st.spinner('جاري استخراج العناوين والهيكلة...'):
+            text = extract_text_from_docx(file_tab2)
+            # وضع 'structure' هنا لتفعيل استخراج العناوين والمجالات
+            result = analyze_with_cerebras(text, api_key, model_choice, mode="structure")
+            
+            # معالجة JSON
+            final_data = []
+            if isinstance(result, dict):
+                for val in result.values():
+                    if isinstance(val, list): final_data = val; break
+                if not final_data and "error" not in result: final_data = [result]
+            elif isinstance(result, list): final_data = result
+            
+            if final_data:
+                df = pd.DataFrame(final_data)
                 
-                progress_bar.progress(90)
+                # ترتيب الأعمدة
+                cols = ["المجال_أو_المقطع", "النشاط", "الموضوع", "الكفاءة_الختامية", "المؤشر"]
+                df = df[[c for c in cols if c in df.columns] + [c for c in df.columns if c not in cols]]
                 
-                # خطوة 3: عرض النتائج
-                final_data = []
-                if isinstance(result, dict):
-                    # البحث عن القائمة داخل الـ JSON
-                    for key, val in result.items():
-                        if isinstance(val, list):
-                            final_data = val
-                            break
-                    if not final_data and "error" not in result:
-                         # ربما الرد هو كائن واحد فقط
-                         final_data = [result]
-                elif isinstance(result, list):
-                    final_data = result
+                st.success(f"تم استخراج {len(df)} درساً.")
                 
-                progress_bar.progress(100)
-                time.sleep(0.5)
-                progress_bar.empty()
-                status_text.empty()
-
-                if "error" in result:
-                    st.error(f"❌ حدث خطأ في المعالجة: {result['error']}")
-                elif not final_data:
-                    st.warning("⚠️ لم يتم العثور على بيانات مهيكلة. تأكد من محتوى الملف.")
-                else:
-                    # --- عرض النتائج بنجاح ---
-                    st.success(f"✅ تم استخراج {len(final_data)} عنصراً بنجاح!")
-                    
-                    # إنشاء DataFrame
-                    df = pd.DataFrame(final_data)
-                    
-                    # ترتيب الأعمدة (جعل العنوان والمجال في البداية)
-                    cols_order = ["المجال_أو_المقطع", "النشاط", "الموضوع", "الكفاءة_الختامية", "المؤشر"]
-                    # التأكد من وجود الأعمدة
-                    existing_cols = [c for c in cols_order if c in df.columns]
-                    remaining_cols = [c for c in df.columns if c not in existing_cols]
-                    df = df[existing_cols + remaining_cols]
-
-                    # عرض تفاعلي (Data Editor) يسمح بالتعديل
-                    st.markdown("### 📝 مراجعة البيانات (يمكنك التعديل مباشرة في الجدول)")
-                    edited_df = st.data_editor(
-                        df,
-                        use_container_width=True,
-                        num_rows="dynamic",
-                        column_config={
-                            "المجال_أو_المقطع": st.column_config.TextColumn("المجال / الوحدة", help="العنوان الرئيسي أو الميدان"),
-                            "النشاط": st.column_config.TextColumn("النشاط", width="small"),
-                            "الموضوع": st.column_config.TextColumn("عنوان الدرس", width="medium"),
-                            "الكفاءة_الختامية": st.column_config.TextColumn("الكفاءة", width="large"),
-                        }
-                    )
-                    
-                    st.markdown("---")
-                    
-                    # --- منطقة التحميل ---
-                    st.subheader("📥 تحميل البيانات")
-                    c1, c2, c3 = st.columns(3)
-                    
-                    # تحميل Excel (مع تنسيق بسيط)
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        edited_df.to_excel(writer, index=False, sheet_name='Educational_Data')
-                        # تجميل تلقائي لأعمدة اكسل
-                        worksheet = writer.sheets['Educational_Data']
-                        for column_cells in worksheet.columns:
-                            length = max(len(str(cell.value)) for cell in column_cells)
-                            worksheet.column_dimensions[column_cells[0].column_letter].width = min(length + 2, 50)
-                            
-                    c1.download_button(
-                        label="تحميل ملف Excel 📗",
-                        data=buffer.getvalue(),
-                        file_name="extracted_lessons.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    
-                    # تحميل CSV
-                    c2.download_button(
-                        label="تحميل ملف CSV 📄",
-                        data=edited_df.to_csv(index=False).encode('utf-8-sig'),
-                        file_name="extracted_lessons.csv",
-                        mime="text/csv"
-                    )
-                    
-                    # تحميل JSON
-                    c3.download_button(
-                        label="تحميل ملف JSON ⚙️",
-                        data=json.dumps(final_data, ensure_ascii=False, indent=4),
-                        file_name="extracted_lessons.json",
-                        mime="application/json"
-                    )
-
-            except Exception as e:
-                st.error(f"حدث خطأ غير متوقع: {e}")
-
-else:
-    # عرض رسالة ترحيبية عند عدم وجود ملف
-    st.info("👆 ابدأ برفع ملف المذكرات من الأعلى.")
+                # جدول قابل للتعديل
+                st.subheader("📝 مراجعة وتعديل البيانات")
+                edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+                
+                # تحميل
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    edited_df.to_excel(writer, index=False, sheet_name='Data')
+                
+                c1, c2 = st.columns(2)
+                c1.download_button("📥 تحميل Excel", buffer.getvalue(), "lessons_structured.xlsx")
+                c2.download_button("📥 تحميل JSON", json.dumps(final_data, ensure_ascii=False), "data.json")
+                
+            else:
+                st.error("لم يتم العثور على بيانات مهيكلة أو حدث خطأ.")
