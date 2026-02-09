@@ -1,119 +1,153 @@
 import streamlit as st
-import requests
-import json
+from docx import Document
+from transformers import pipeline
+import io
 
-# --- 1. إعدادات الصفحة ---
-st.set_page_config(page_title="Cerebras Debugger", page_icon="🛠️")
+# ---------------------------------------------------------
+# 1. إعداد الصفحة وتصميمها
+# ---------------------------------------------------------
+st.set_page_config(
+    page_title="المتلخص الذكي للمستندات",
+    page_icon="📑",
+    layout="centered",
+    initial_sidebar_state="expanded"
+)
 
-# تخصيص CSS
+# تخصيص CSS لدعم العربية (RTL) وتجميل الواجهة
 st.markdown("""
 <style>
-    .stChatMessage { direction: rtl; text-align: right; }
-    .stTextInput > div > div > input { direction: rtl; text-align: right; }
-    .stSelectbox > div > div > div { direction: rtl; }
+    .main { text-align: right; }
+    h1, h2, h3 { font-family: 'Segoe UI', sans-serif; text-align: right; }
+    .stMarkdown, p, div { text-align: right; direction: rtl; }
+    .stButton>button { width: 100%; background-color: #4CAF50; color: white; }
+    .stDownloadButton>button { width: 100%; background-color: #008CBA; color: white; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛠️ فحص موديلات Cerebras")
+st.title("📑 تلخيص ملفات Word بالذكاء الاصطناعي")
+st.markdown("قم برفع ملف `.docx` وسيقوم النموذج باستخراج العناوين وتلخيص محتواها.")
 
-# --- 2. المفتاح ---
-try:
-    api_key = st.secrets["CEREBRAS_API_KEY"]
-except:
-    api_key = st.sidebar.text_input("API Key:", type="password")
+# ---------------------------------------------------------
+# 2. تحميل نموذج الذكاء الاصطناعي (Caching)
+# ---------------------------------------------------------
+@st.cache_resource
+def load_model():
+    """
+    تحميل النموذج مرة واحدة فقط وحفظه في الذاكرة
+    لتجنب إعادة التحميل مع كل ضغطة زر.
+    """
+    model_name = "csebuetnlp/mT5_multilingual_XLSum"
+    summarizer = pipeline("summarization", model=model_name, device=-1) # device=-1 for CPU
+    return summarizer
 
-if not api_key:
-    st.warning("الرجاء إدخال المفتاح.")
-    st.stop()
-
-# --- 3. القائمة ---
-with st.sidebar:
-    st.header("اختيار الموديل")
-    
-    # القائمة الكاملة التي ظهرت لك
-    models = [
-        "llama-3.3-70b",   # ✅ (ممتاز ومستقر)
-        "llama3.1-8b",     # ✅ (سريع جداً)
-        "qwen-3-32b",      # ❓ (جرب)
-        "gpt-oss-120b",    # ⚠️ (غالباً تجريبي)
-        "zai-glm-4.7",     # ⚠️ (قد لا يعمل)
-        "qwen-3-235b-a22b-instruct-2507" # ⚠️ (اسم معقد قد يتغير)
-    ]
-    
-    selected_model = st.radio("اختر موديل للتجربة:", models)
-    
-    if st.button("🗑️ مسح الذاكرة"):
-        st.session_state.messages = []
-        st.rerun()
-
-# --- 4. الدالة مع كشف الأخطاء التفصيلي ---
-def stream_chat_debug(messages, api_key, model):
-    url = "https://api.cerebras.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "max_tokens": 1000
-    }
-    
+# تحميل النموذج مع مؤشر انتظار
+with st.spinner('جاري تحميل نموذج الذكاء الاصطناعي... (يحدث مرة واحدة فقط)'):
     try:
-        response = requests.post(url, headers=headers, json=data, stream=True)
-        
-        # إذا كان هناك خطأ من السيرفر (ليس 200)
-        if response.status_code != 200:
-            error_details = response.text
-            try:
-                # محاولة قراءة الخطأ بصيغة JSON ليكون أوضح
-                error_json = response.json()
-                error_msg = error_json.get('error', {}).get('message', error_details)
-                yield f"⛔ **فشل الموديل:** {model}\n\n**السبب:** {error_msg}"
-            except:
-                yield f"⛔ **خطأ غير معروف:** رمز الحالة {response.status_code}\n{error_details}"
-            return
-
-        # إذا نجح الاتصال، ابدأ البث
-        for line in response.iter_lines():
-            if line:
-                decoded = line.decode('utf-8').replace("data: ", "")
-                if decoded.strip() == "[DONE]": break
-                try:
-                    chunk = json.loads(decoded)
-                    content = chunk['choices'][0]['delta'].get('content', '')
-                    if content: yield content
-                except: continue
-                
+        summarizer = load_model()
     except Exception as e:
-        yield f"❌ خطأ في الاتصال بالإنترنت: {e}"
+        st.error(f"حدث خطأ أثناء تحميل النموذج: {e}")
+        st.stop()
 
-# --- 5. التشغيل ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ---------------------------------------------------------
+# 3. دوال المعالجة والتلخيص
+# ---------------------------------------------------------
+def summarize_text(text):
+    clean_text = text.strip()
+    if not clean_text:
+        return "لا يوجد محتوى."
+    
+    words = clean_text.split()
+    if len(words) < 30:
+        return clean_text  # النص قصير جداً لا يحتاج تلخيص
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    try:
+        summary = summarizer(
+            clean_text,
+            max_length=100,
+            min_length=30,
+            do_sample=False,
+            truncation=True
+        )
+        return summary[0]['summary_text']
+    except Exception:
+        return "النص طويل جداً أو معقد، تم عرض جزء منه."
 
-if prompt := st.chat_input("جرب الموديل بكلمة 'مرحبا'"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+def process_docx(file):
+    doc = Document(file)
+    results = []
+    current_title = "مقدمة / بدون عنوان"
+    buffer = ""
 
-    with st.chat_message("assistant"):
-        response_holder = st.empty()
-        full_text = ""
-        
-        # استدعاء دالة الفحص
-        for chunk in stream_chat_debug(st.session_state.messages, api_key, selected_model):
-            full_text += chunk
-            response_holder.markdown(full_text + "▌")
-        
-        response_holder.markdown(full_text)
-        
-        # إذا كان الرد رسالة خطأ، لا نحفظه في الذاكرة لكي لا يفسد المحادثة التالية
-        if "⛔" not in full_text:
-            st.session_state.messages.append({"role": "assistant", "content": full_text})
+    # شريط التقدم
+    progress_bar = st.progress(0)
+    total_paragraphs = len(doc.paragraphs)
+    
+    for i, para in enumerate(doc.paragraphs):
+        # تحديث شريط التقدم
+        if i % 10 == 0:
+            progress_bar.progress(min(i / total_paragraphs, 1.0))
 
+        if para.style.name.startswith("Heading"):
+            # تلخيص ما سبق قبل الانتقال للعنوان الجديد
+            if buffer.strip():
+                summary = summarize_text(buffer)
+                results.append({"title": current_title, "summary": summary})
+            
+            current_title = para.text
+            buffer = ""
+        else:
+            buffer += para.text + " "
+
+    # إضافة آخر قسم
+    if buffer.strip():
+        summary = summarize_text(buffer)
+        results.append({"title": current_title, "summary": summary})
+    
+    progress_bar.progress(1.0)
+    return results
+
+def create_download_file(results):
+    """إنشاء ملف نصي للنتائج للتحميل"""
+    output_text = "ملخص المستند - تم بواسطة الذكاء الاصطناعي\n"
+    output_text += "="*40 + "\n\n"
+    
+    for item in results:
+        output_text += f"📌 العنوان: {item['title']}\n"
+        output_text += f"📄 الملخص: {item['summary']}\n"
+        output_text += "-"*40 + "\n"
+    
+    return output_text
+
+# ---------------------------------------------------------
+# 4. واجهة المستخدم الرئيسية
+# ---------------------------------------------------------
+uploaded_file = st.file_uploader("اختر ملف Word", type=["docx"])
+
+if uploaded_file is not None:
+    st.info(f"تم رفع الملف: {uploaded_file.name}")
+
+    if st.button("🚀 ابدأ التحليل والتلخيص"):
+        with st.spinner('جاري قراءة الملف وتلخيص الفقرات...'):
+            try:
+                results = process_docx(uploaded_file)
+                
+                st.success("تم الانتهاء من التلخيص!")
+                st.divider()
+
+                # عرض النتائج
+                for item in results:
+                    with st.expander(f"📌 {item['title']}", expanded=True):
+                        st.write(item['summary'])
+                
+                # زر التحميل (Download)
+                st.divider()
+                download_str = create_download_file(results)
+                st.download_button(
+                    label="📥 تحميل الملخص كملف نصي (TXT)",
+                    data=download_str,
+                    file_name="summary_report.txt",
+                    mime="text/plain"
+                )
+
+            except Exception as e:
+                st.error(f"حدث خطأ غير متوقع: {e}")
