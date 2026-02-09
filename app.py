@@ -1,170 +1,224 @@
 import streamlit as st
 from docx import Document
-from transformers import pipeline
+from cerebras.cloud.sdk import Cerebras
+import pandas as pd
+import json
 import io
 
 # ---------------------------------------------------------
-# 1. إعداد الصفحة وتصميمها (RTL للعربية)
+# 1. إعداد الصفحة وتصميمها
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="المتلخص الذكي للمستندات",
-    page_icon="📑",
-    layout="centered"
+    page_title="مستخرج البيانات التربوية (Cerebras)",
+    page_icon="🚀",
+    layout="wide"
 )
 
-# تخصيص CSS لدعم العربية (RTL) بشكل كامل
+# تخصيص CSS للعربية
 st.markdown("""
 <style>
     .main { direction: rtl; text-align: right; }
-    .stMarkdown, .stButton, .stDownloadButton, .stFileUploader, h1, h2, h3, p, div { 
+    .stMarkdown, .stButton, .stDownloadButton, .stFileUploader, h1, h2, h3, p, div, label, input { 
         text-align: right; 
         direction: rtl; 
     }
-    /* جعل النصوص داخل الصناديق محاذاة لليمين */
-    .stAlert { direction: rtl; text-align: right; }
-    .stExpander { direction: rtl; }
+    .stDataFrame { direction: ltr; } 
+    [data-testid="stSidebar"] { text-align: right; direction: rtl; }
+    
+    /* تنسيق خاص لرسائل الخطأ والنجاح */
+    .stSuccess, .stError, .stWarning { direction: rtl; text-align: right; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📑 تلخيص ملفات Word بالذكاء الاصطناعي")
-st.write("---")
-
 # ---------------------------------------------------------
-# 2. تحميل نموذج الذكاء الاصطناعي (Caching)
+# 2. الشريط الجانبي: إعدادات API
 # ---------------------------------------------------------
-@st.cache_resource
-def load_model():
-    """
-    تحميل النموذج مرة واحدة فقط.
-    تم تغيير المهمة إلى 'text2text-generation' لحل مشكلة Unknown task.
-    """
-    model_name = "csebuetnlp/mT5_multilingual_XLSum"
-    # التصحيح الأساسي هنا: استخدام text2text-generation
-    pipe = pipeline("text2text-generation", model=model_name)
-    return pipe
-
-# تحميل النموذج في الخلفية
-try:
-    with st.spinner('جاري تهيئة نموذج الذكاء الاصطناعي... (يرجى الانتظار دقيقة في المرة الأولى)'):
-        summarizer = load_model()
-except Exception as e:
-    st.error(f"حدث خطأ في تحميل النموذج: {e}")
-    st.stop()
+with st.sidebar:
+    st.header("⚙️ الإعدادات")
+    api_key = st.text_input("Cerebras API Key", type="password", help="أدخل مفتاح Cerebras الخاص بك هنا")
+    
+    # اختيار النموذج (Cerebras يدعم Llama بشكل ممتاز)
+    model_choice = st.selectbox(
+        "اختر النموذج",
+        ["llama3.1-70b", "llama-3.3-70b"],
+        index=0
+    )
+    
+    st.info("يتميز Cerebras بسرعة فائقة في معالجة النصوص الطويلة.")
 
 # ---------------------------------------------------------
 # 3. دوال المعالجة
 # ---------------------------------------------------------
-def summarize_text(text):
-    """دالة التلخيص مع معالجة الأخطاء"""
-    clean_text = text.strip()
-    if not clean_text:
-        return "لا يوجد محتوى."
+def extract_text_from_docx(file):
+    """قراءة كل النصوص داخل الملف (فقرات + جداول) لضمان عدم ضياع أي معلومة"""
+    doc = Document(file)
+    full_text = []
     
-    words = clean_text.split()
-    if len(words) < 30:
-        return clean_text  # النص قصير جداً لا يحتاج تلخيص
+    # 1. قراءة الفقرات العادية
+    for para in doc.paragraphs:
+        if para.text.strip():
+            full_text.append(para.text)
+            
+    # 2. قراءة الجداول (الأهم في المذكرات التربوية)
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = []
+            for cell in row.cells:
+                # تنظيف النص داخل الخلية
+                cell_text = cell.text.strip().replace("\n", " ")
+                if cell_text:
+                    row_text.append(cell_text)
+            if row_text:
+                # دمج خلايا الصف بفاصل مميز
+                full_text.append(" | ".join(row_text))
+                
+    return "\n".join(full_text)
+
+def analyze_with_cerebras(text, key, model_id):
+    """إرسال النص لنموذج Cerebras لاستخراج البيانات JSON"""
+    
+    client = Cerebras(api_key=key)
+    
+    # هندسة الأوامر (Prompt Engineering) دقيقة جداً
+    system_prompt = """
+    أنت مساعد إداري تربوي خبير في تحليل المذكرات التربوية الجزائرية.
+    مهمتك هي استخراج بيانات الأنشطة التربوية من النص المقدم بدقة عالية.
+    
+    يجب أن تستخرج البيانات التالية لكل نشاط تجده:
+    1. "النشاط": (مثال: تعبير شفوي، رياضيات، تربية إسلامية...)
+    2. "الموضوع": (عنوان الدرس)
+    3. "الكفاءة_القاعدية": (نص الكفاءة المستهدفة)
+    4. "مؤشر_الكفاءة": (مؤشر واحد أو أكثر)
+
+    القواعد الصارمة:
+    - المخرج يجب أن يكون JSON Valid فقط.
+    - التنسيق: قائمة من الكائنات (List of Objects).
+    - لا تضف أي نص قبل أو بعد الـ JSON (مثل "Here is the code").
+    - إذا كانت المعلومة مفقودة، اكتب "غير مذكور".
+    - النص يحتوي على جداول تم تحويلها لنص، حاول فهم السياق.
+    """
+
+    user_prompt = f"""
+    استخرج البيانات من النص التالي:
+    
+    {text[:25000]} 
+    """ 
+    # Cerebras يدعم سياق كبير، لكن نحدد 25000 حرف للأمان
 
     try:
-        # mT5 يتطلب text2text-generation
-        result = summarizer(
-            clean_text,
-            max_length=150,  # أقصى طول للملخص
-            min_length=30,   # أقل طول للملخص
-            do_sample=False,
-            truncation=True  # قص النص إذا كان طويلاً جداً
+        completion = client.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1, # حرارة منخفضة للدقة
+            max_tokens=4000,
+            response_format={"type": "json_object"} # إجبار النموذج على إخراج JSON
         )
-        # التصحيح الثاني: المفتاح هو generated_text
-        return result[0]['generated_text']
+        
+        response_content = completion.choices[0].message.content
+        
+        # التأكد من أن النص هو JSON صافي
+        return json.loads(response_content)
+        
+    except json.JSONDecodeError:
+        return {"error": "فشل النموذج في إرجاع تنسيق JSON صحيح. حاول مرة أخرى."}
     except Exception as e:
-        return f"تعذر التلخيص: {e}"
-
-def process_docx(file):
-    """قراءة ملف Word وتقسيمه حسب العناوين"""
-    doc = Document(file)
-    results = []
-    
-    current_title = "مقدمة / بدون عنوان"
-    buffer = ""
-
-    # شريط التقدم
-    progress_bar = st.progress(0)
-    total_paragraphs = len(doc.paragraphs)
-    if total_paragraphs == 0:
-        total_paragraphs = 1
-    
-    for i, para in enumerate(doc.paragraphs):
-        # تحديث شريط التقدم كل 10 فقرات
-        if i % 10 == 0:
-            progress_bar.progress(min(i / total_paragraphs, 1.0))
-
-        if para.style.name.startswith("Heading"):
-            # إذا وجدنا عنواناً جديداً، نلخص ما قبله
-            if buffer.strip():
-                summary = summarize_text(buffer)
-                results.append({"title": current_title, "summary": summary})
-            
-            current_title = para.text
-            buffer = ""
-        else:
-            buffer += para.text + " "
-
-    # إضافة القسم الأخير المتبقي في الذاكرة
-    if buffer.strip():
-        summary = summarize_text(buffer)
-        results.append({"title": current_title, "summary": summary})
-    
-    progress_bar.progress(1.0)
-    return results
-
-def create_download_file(results):
-    """تجهيز ملف نصي للتحميل"""
-    output = io.StringIO()
-    output.write("تقرير التلخيص الآلي\n")
-    output.write("===================\n\n")
-    for item in results:
-        output.write(f"📌 {item['title']}\n")
-        output.write(f"{item['summary']}\n")
-        output.write("-" * 30 + "\n")
-    return output.getvalue()
+        return {"error": str(e)}
 
 # ---------------------------------------------------------
-# 4. واجهة الرفع والعرض (الرئيسية)
+# 4. واجهة المستخدم الرئيسية
 # ---------------------------------------------------------
+st.title("🚀 استخراج المذكرات التربوية (Cerebras AI)")
+st.markdown("""
+هذا التطبيق يستخدم **Cerebras** لاستخراج:
+- **النشاط**
+- **الموضوع**
+- **الكفاءة القاعدية**
+- **مؤشر الكفاءة**
+""")
 
-# زر الرفع (موجود دائماً في الواجهة)
 uploaded_file = st.file_uploader("📂 اختر ملف Word (.docx)", type=["docx"])
 
-if uploaded_file is not None:
-    st.success(f"تم استلام الملف: {uploaded_file.name}")
-
-    # زر البدء
-    if st.button("🚀 ابدأ التحليل والتلخيص"):
-        with st.spinner('جاري قراءة الملف وتلخيص الفقرات...'):
+if uploaded_file and api_key:
+    if st.button("⚡ ابدأ التحليل السريع"):
+        with st.spinner('جاري قراءة الملف وتحليل البيانات بسرعة البرق...'):
             try:
-                # عملية المعالجة
-                final_results = process_docx(uploaded_file)
+                # 1. استخراج النص
+                raw_text = extract_text_from_docx(uploaded_file)
                 
-                st.balloons() # احتفال بانتهاء العملية
-                st.success("تم الانتهاء بنجاح!")
-                st.write("---")
-
-                # عرض النتائج
-                for item in final_results:
-                    with st.expander(f"📌 {item['title']}", expanded=True):
-                        st.write(item['summary'])
+                # 2. التحليل بالذكاء الاصطناعي
+                # نتوقع أن يعود JSON يحتوي على مفتاح رئيسي مثل "lessons" أو قائمة مباشرة
+                result = analyze_with_cerebras(raw_text, api_key, model_choice)
                 
-                # تحميل النتائج
-                st.write("---")
-                txt_data = create_download_file(final_results)
-                st.download_button(
-                    label="📥 تحميل التقرير (TXT)",
-                    data=txt_data,
-                    file_name="summary_report.txt",
-                    mime="text/plain"
-                )
+                # معالجة هيكل الـ JSON العائد (قد يكون قائمة مباشرة أو داخل مفتاح)
+                data_list = []
+                if isinstance(result, list):
+                    data_list = result
+                elif isinstance(result, dict):
+                    # البحث عن القائمة داخل القاموس
+                    for key, value in result.items():
+                        if isinstance(value, list):
+                            data_list = value
+                            break
+                    # إذا لم نجد قائمة، ربما القاموس نفسه هو عنصر واحد
+                    if not data_list and "النشاط" in result:
+                        data_list = [result]
+                
+                if data_list:
+                    st.success(f"تم استخراج {len(data_list)} نشاط بنجاح!")
+                    
+                    # 3. تحويل إلى جدول وعرضه
+                    df = pd.DataFrame(data_list)
+                    
+                    # إعادة ترتيب الأعمدة لتكون منطقية
+                    cols_order = ["النشاط", "الموضوع", "الكفاءة_القاعدية", "مؤشر_الكفاءة"]
+                    # نختار فقط الأعمدة الموجودة فعلياً
+                    final_cols = [c for c in cols_order if c in df.columns]
+                    # نضيف باقي الأعمدة إن وجدت
+                    remaining_cols = [c for c in df.columns if c not in final_cols]
+                    df = df[final_cols + remaining_cols]
 
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # 4. خيارات التحميل
+                    col1, col2 = st.columns(2)
+                    
+                    # تحميل Excel
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False, sheet_name='المذكرات')
+                        
+                    with col1:
+                        st.download_button(
+                            label="📥 تحميل كملف Excel",
+                            data=buffer.getvalue(),
+                            file_name="lesson_plans_cerebras.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                        
+                    # تحميل JSON
+                    json_str = json.dumps(data_list, ensure_ascii=False, indent=4)
+                    with col2:
+                        st.download_button(
+                            label="📥 تحميل كملف JSON",
+                            data=json_str,
+                            file_name="lesson_plans.json",
+                            mime="application/json"
+                        )
+                
+                elif "error" in result:
+                    st.error(f"خطأ: {result['error']}")
+                else:
+                    st.warning("لم يتم العثور على بيانات. تحقق من محتوى الملف.")
+                    
             except Exception as e:
-                st.error(f"حدث خطأ غير متوقع أثناء المعالجة: {e}")
+                st.error(f"حدث خطأ غير متوقع: {e}")
 
-# تذييل الصفحة
-st.markdown("<br><br><p style='text-align:center; color:grey;'>تم التطوير باستخدام Streamlit & Transformers</p>", unsafe_allow_html=True)
+elif uploaded_file and not api_key:
+    st.warning("⚠️ يرجى إدخال مفتاح Cerebras API في القائمة الجانبية.")
+
+# تذييل
+st.write("---")
+st.markdown("<p style='text-align:center; color:grey;'>Powered by Cerebras Llama-3.1-70b</p>", unsafe_allow_html=True)
