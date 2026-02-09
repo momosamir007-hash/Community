@@ -1,2 +1,7 @@
+
 streamlit
-cerebras_cloud_sdk
+python-docx
+transformers
+torch
+sentencepiece
+watchdog
