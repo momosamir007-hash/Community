@@ -5,3 +5,5 @@ transformers
 torch
 sentencepiece
 watchdog
+cerebras_cloud_sdk
+
