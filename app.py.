@@ -1,236 +1,0 @@
-import streamlit as st
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.enum.table import WD_TABLE_DIRECTION
-from cerebras.cloud.sdk import Cerebras
-import pandas as pd
-import json
-import io
-
-# ---------------------------------------------------------
-# 1. إعداد التوقيت الأسبوعي (بناءً على الصورة 1)
-# ---------------------------------------------------------
-# ملاحظة: تم تقدير التوقيت بناءً على الفترات الزمنية القياسية (30 دقيقة للحصة)
-WEEKLY_SCHEDULE = {
-    "الأحد": [
-        {"time": "08:00 - 09:45", "activity": "تعبير شفوي"},
-        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
-        {"time": "08:00 - 09:45", "activity": "رياضيات"},
-        {"time": "10:00 - 11:15", "activity": "ت علمية"},
-        {"time": "10:00 - 11:15", "activity": "ت إسلامية"},
-        {"time": "13:00 - 15:00", "activity": "مسرح وعرائس"},
-        {"time": "13:00 - 15:00", "activity": "رسم وأشغال"},
-        {"time": "13:00 - 15:00", "activity": "ت بدنية"}
-    ],
-    "الاثنين": [
-        {"time": "08:00 - 09:45", "activity": "رياضيات"},
-        {"time": "08:00 - 09:45", "activity": "تعبير شفوي"},
-        {"time": "08:00 - 09:45", "activity": "تخطيط"},
-        {"time": "10:00 - 11:15", "activity": "ت علمية"},
-        {"time": "10:00 - 11:15", "activity": "ت مدنية"},
-        {"time": "13:00 - 15:00", "activity": "مسرح وعرائس"},
-        {"time": "13:00 - 15:00", "activity": "رسم وأشغال"},
-        {"time": "13:00 - 15:00", "activity": "ت بدنية"}
-    ],
-    "الثلاثاء": [
-        {"time": "08:00 - 09:45", "activity": "تعبير شفوي"},
-        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
-        {"time": "08:00 - 09:45", "activity": "رياضيات"},
-        {"time": "10:00 - 11:15", "activity": "ت إسلامية"},
-        {"time": "10:00 - 11:15", "activity": "ت بدنية"}
-    ],
-    "الأربعاء": [
-        {"time": "08:00 - 09:45", "activity": "رياضيات"},
-        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
-        {"time": "08:00 - 09:45", "activity": "تخطيط"},
-        {"time": "10:00 - 11:15", "activity": "ت علمية"},
-        {"time": "10:00 - 11:15", "activity": "ت مدنية"},
-        {"time": "13:00 - 15:00", "activity": "ت إيقاعية"},
-        {"time": "13:00 - 15:00", "activity": "موسيقى وإنشاد"},
-        {"time": "13:00 - 15:00", "activity": "ت بدنية"}
-    ],
-    "الخميس": [
-        {"time": "08:00 - 09:45", "activity": "مبادئ القراءة"},
-        {"time": "08:00 - 09:45", "activity": "رياضيات"},
-        {"time": "08:00 - 09:45", "activity": "ت علمية"},
-        {"time": "10:00 - 11:15", "activity": "ت إيقاعية"},
-        {"time": "10:00 - 11:15", "activity": "موسيقى وإنشاد"}
-    ]
-}
-
-# ---------------------------------------------------------
-# 2. إعداد الصفحة
-# ---------------------------------------------------------
-st.set_page_config(page_title="المذكرة اليومية الآلية", layout="wide", page_icon="📅")
-st.markdown("""<style>.main { direction: rtl; text-align: right; } h1, h2, h3, p, div { text-align: right; }</style>""", unsafe_allow_html=True)
-
-# ---------------------------------------------------------
-# 3. دوال المعالجة (نفس الدوال السابقة مع تعديلات بسيطة)
-# ---------------------------------------------------------
-def extract_text_from_docx(file):
-    doc = Document(file)
-    full_text = []
-    for para in doc.paragraphs:
-        if para.text.strip(): full_text.append(para.text)
-    for table in doc.tables:
-        for row in table.rows:
-            row_text = [cell.text.strip().replace("\n", " ") for cell in row.cells if cell.text.strip()]
-            if row_text: full_text.append(" | ".join(row_text))
-    return "\n".join(full_text)
-
-def analyze_with_cerebras(text, key, model_id):
-    client = Cerebras(api_key=key)
-    # تحسين البرومبت ليتوافق مع أسماء الأنشطة في الجدول
-    system_prompt = """
-    أنت مساعد تربوي. استخرج بيانات الدروس من النص.
-    الحقول المطلوبة:
-    1. "النشاط": (يجب أن يكون مطابقاً تماماً لأحد هذه المصطلحات: رياضيات، تعبير شفوي، مبادئ القراءة، تخطيط، ت علمية، ت إسلامية، ت مدنية، ت بدنية، مسرح وعرائس، رسم وأشغال، ت إيقاعية، موسيقى وإنشاد).
-    2. "الموضوع": عنوان الدرس.
-    3. "الكفاءة": الكفاءة القاعدية أو المستهدفة.
-    4. "المؤشر": مؤشر الكفاءة.
-    
-    المخرج JSON List فقط.
-    """
-    try:
-        completion = client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text[:20000]}],
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
-        return json.loads(completion.choices[0].message.content)
-    except Exception as e:
-        return {"error": str(e)}
-
-# ---------------------------------------------------------
-# 4. دالة إنشاء ملف المذكرة اليومية (Word)
-# ---------------------------------------------------------
-def create_daily_journal(day_name, extracted_lessons):
-    doc = Document()
-    
-    # تنسيق الصفحة للكتابة من اليمين لليسار
-    section = doc.sections[0]
-    section.page_width = Inches(8.27) # A4
-    section.page_height = Inches(11.69)
-    
-    # عنوان
-    title = doc.add_heading(f'المذكرة اليومية - يوم: {day_name}', 0)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # إنشاء الجدول (يشبه الصورة 2)
-    # الأعمدة: التوقيت، النشاط، الموضوع، الكفاءة، المؤشر، ملاحظات
-    headers = ["التوقيت", "النشاط", "الموضوع (المحتوى)", "الكفاءة", "المؤشر", "ملاحظات"]
-    table = doc.add_table(rows=1, cols=len(headers))
-    table.style = 'Table Grid'
-    table.direction = WD_TABLE_DIRECTION.RTL # اتجاه الجدول يمين يسار
-    
-    # تعبئة العناوين
-    hdr_cells = table.rows[0].cells
-    for i, header in enumerate(headers):
-        hdr_cells[i].text = header
-        # جعل الخط غليظ للعناوين
-        run = hdr_cells[i].paragraphs[0].runs[0]
-        run.font.bold = True
-        run.font.size = Pt(11)
-
-    # جلب جدول اليوم المحدد
-    day_schedule = WEEKLY_SCHEDULE.get(day_name, [])
-    
-    # البحث عن البيانات ومطابقتها
-    # extracted_lessons يجب أن تكون قائمة من القواميس
-    lessons_list = []
-    if isinstance(extracted_lessons, dict):
-        for val in extracted_lessons.values():
-            if isinstance(val, list): lessons_list = val; break
-        if not lessons_list: lessons_list = [extracted_lessons]
-    else:
-        lessons_list = extracted_lessons
-
-    # تعبئة الجدول
-    for slot in day_schedule:
-        row_cells = table.add_row().cells
-        
-        # تعبئة التوقيت والنشاط من الجدول الثابت
-        row_cells[0].text = slot['time']
-        row_cells[1].text = slot['activity']
-        
-        # البحث عن محتوى الدرس من البيانات المستخرجة (Matching)
-        found_lesson = None
-        for lesson in lessons_list:
-            # مطابقة مرنة للنص
-            if slot['activity'] in lesson.get('النشاط', '') or lesson.get('النشاط', '') in slot['activity']:
-                found_lesson = lesson
-                break
-        
-        if found_lesson:
-            row_cells[2].text = str(found_lesson.get('الموضوع', ''))
-            row_cells[3].text = str(found_lesson.get('الكفاءة', ''))
-            row_cells[4].text = str(found_lesson.get('المؤشر', ''))
-        else:
-            row_cells[2].text = "" # ترك المكان فارغ للكتابة اليدوية إذا لم يجد الدرس
-
-        # تنسيق الخط داخل الخلايا
-        for cell in row_cells:
-            for paragraph in cell.paragraphs:
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                if paragraph.runs:
-                    paragraph.runs[0].font.size = Pt(10)
-                    paragraph.runs[0].font.name = "Arial"
-
-    return doc
-
-# ---------------------------------------------------------
-# 5. الواجهة الرئيسية
-# ---------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ الإعدادات")
-    if "CEREBRAS_API_KEY" in st.secrets:
-        api_key = st.secrets["CEREBRAS_API_KEY"]
-    else:
-        api_key = st.text_input("API Key", type="password")
-    
-    model_choice = st.selectbox("النموذج", ["llama3.1-70b", "llama-3.3-70b"])
-
-st.title("📝 مولد المذكرة اليومية الآلي")
-st.info("ارفع ملف المذكرات (Word)، وسأقوم بملء جدول التوقيت الأسبوعي (الصورة 1) في نموذج المذكرة اليومية (الصورة 2).")
-
-uploaded_file = st.file_uploader("📂 اختر ملف المذكرات (.docx)", type=["docx"])
-selected_day = st.selectbox("📅 اختر اليوم لإنشاء المذكرة:", list(WEEKLY_SCHEDULE.keys()))
-
-if uploaded_file and st.button("🚀 إنشاء المذكرة"):
-    if not api_key:
-        st.error("مفتاح API مفقود.")
-    else:
-        with st.spinner('جاري تحليل الدروس ومطابقتها مع الجدول...'):
-            try:
-                # 1. استخراج النصوص
-                text = extract_text_from_docx(uploaded_file)
-                # 2. تحليل الذكاء الاصطناعي
-                data = analyze_with_cerebras(text, api_key, model_choice)
-                
-                if "error" not in data:
-                    # 3. إنشاء ملف Word
-                    doc = create_daily_journal(selected_day, data)
-                    
-                    # حفظ في الذاكرة
-                    bio = io.BytesIO()
-                    doc.save(bio)
-                    
-                    st.success(f"تم إنشاء مذكرة يوم {selected_day} بنجاح!")
-                    
-                    st.download_button(
-                        label=f"📥 تحميل مذكرة {selected_day} (Word)",
-                        data=bio.getvalue(),
-                        file_name=f"Daily_Journal_{selected_day}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                    
-                    # عرض البيانات المستخرجة للمراجعة
-                    st.markdown("### البيانات التي تم استخراجها:")
-                    st.json(data)
-                else:
-                    st.error(f"خطأ: {data['error']}")
-            except Exception as e:
-                st.error(f"حدث خطأ غير متوقع: {e}")
