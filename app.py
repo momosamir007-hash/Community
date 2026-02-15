@@ -3,7 +3,7 @@ import requests
 import json
 
 # --- 1. إعدادات الصفحة ---
-st.set_page_config(page_title="Multi-Model Debugger", page_icon="🛠️")
+st.set_page_config(page_title="AI Debugger (Cerebras + GLM-5)", page_icon="🧪")
 
 # تخصيص CSS
 st.markdown("""
@@ -11,65 +11,94 @@ st.markdown("""
     .stChatMessage { direction: rtl; text-align: right; }
     .stTextInput > div > div > input { direction: rtl; text-align: right; }
     .stSelectbox > div > div > div { direction: rtl; }
+    .stExpander { direction: rtl; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛠️ فحص موديلات (Cerebras + GLM)")
+st.title("🧪 فحص موديلات (Cerebras + GLM-5)")
 
-# --- 2. المفاتيح (Keys) ---
-# محاولة جلب مفتاح Cerebras
-try:
-    cerebras_key = st.secrets["CEREBRAS_API_KEY"]
-except:
-    cerebras_key = st.sidebar.text_input("Cerebras API Key:", type="password")
-
-# محاولة جلب مفتاح GLM
-try:
-    glm_key = st.secrets["GLM_API_KEY"]
-except:
-    glm_key = st.sidebar.text_input("GLM (Zhipu) API Key:", type="password")
-
-# التحقق من وجود المفاتيح قبل المتابعة (تحذير فقط)
-if not cerebras_key and not glm_key:
-    st.warning("الرجاء إدخال مفتاح API واحد على الأقل.")
-    st.stop()
-
-# --- 3. القائمة ---
+# --- 2. إعداد المفاتيح والروابط ---
 with st.sidebar:
-    st.header("اختيار الموديل")
+    st.header("🔑 إعدادات المفاتيح")
     
-    # القائمة المحدثة
-    models = [
-        "llama-3.3-70b",   # Cerebras
-        "llama3.1-8b",     # Cerebras
-        "glm-4",           # GLM (ZhipuAI) - الموديل المستقر
-        "glm-4-plus",      # GLM (ZhipuAI) - الموديل الأقوى
-        "qwen-3-32b",      # Cerebras
-    ]
+    # 1. مفتاح Cerebras
+    try:
+        cerebras_key = st.secrets["CEREBRAS_API_KEY"]
+    except:
+        cerebras_key = st.text_input("مفتاح Cerebras API:", type="password")
+
+    # 2. مفتاح Zed.ai / GLM
+    try:
+        zed_key = st.secrets["ZED_API_KEY"]
+    except:
+        zed_key = st.text_input("مفتاح Zed.ai API:", type="password")
+
+    st.markdown("---")
     
-    selected_model = st.radio("اختر موديل للتجربة:", models)
+    # إعدادات الروابط
+    with st.expander("⚙️ إعدادات الروابط (Base URLs)"):
+        # ملاحظة: إذا كنت تستخدم chat.z.ai، قد يكون الرابط مختلفاً عن الرابط الرسمي
+        # الرابط الرسمي هو: https://open.bigmodel.cn/api/paas/v4/chat/completions
+        # رابط chat.z.ai المتوقع (جرب هذا إذا لم يعمل الرسمي): https://chat.z.ai/api/v1/chat/completions
+        
+        default_zed_url = st.text_input(
+            "رابط Zed.ai / GLM:", 
+            value="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            help="إذا لم يعمل، جرب: https://chat.z.ai/api/v1/chat/completions"
+        )
+        
+        cerebras_url = "https://api.cerebras.ai/v1/chat/completions"
+
+# --- 3. اختيار الموديل (تحديث القائمة حسب الصورة) ---
+with st.sidebar:
+    st.header("🤖 اختيار الموديل")
     
+    model_options = {
+        "Cerebras": [
+            "llama-3.3-70b",
+            "llama3.1-8b",
+            "qwen-3-32b"
+        ],
+        "Zed.ai (GLM)": [
+            "glm-5",           # ✅ الجديد (Flagship)
+            "glm-4.7",         # ✅ موديل قوي
+            "glm-4.6",         # ✅ كلاسيكي عالي الأداء
+            "glm-4-plus",      # القديم القوي
+            "glm-4-air",       # سريع
+            "glm-4-flash"      # اقتصادي
+        ]
+    }
+    
+    provider = st.selectbox("المزود:", list(model_options.keys()))
+    
+    # خيار لإدخال اسم موديل يدوياً في حالة ظهور موديلات جديدة
+    selected_model_dropdown = st.selectbox("الموديل:", model_options[provider])
+    use_manual = st.checkbox("كتابة اسم الموديل يدوياً؟")
+    
+    if use_manual:
+        selected_model = st.text_input("اكتب اسم الموديل (مثال: glm-4.6v):", value=selected_model_dropdown)
+    else:
+        selected_model = selected_model_dropdown
+
     if st.button("🗑️ مسح الذاكرة"):
         st.session_state.messages = []
         st.rerun()
 
-# --- 4. الدالة الذكية (تختار الرابط والمفتاح حسب الموديل) ---
-def stream_chat_debug(messages, selected_model, c_key, g_key):
+# --- 4. دالة الاتصال الموحدة ---
+def stream_chat_debug(messages, model, provider_name, c_key, z_key, c_url, z_url):
     
-    # تحديد الإعدادات بناءً على اسم الموديل
-    if "glm" in selected_model.lower():
-        # إعدادات GLM (ZhipuAI)
-        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-        api_key = g_key
+    # تحديد الإعدادات
+    if provider_name == "Zed.ai (GLM)":
+        url = z_url
+        api_key = z_key
         if not api_key:
-            yield "⛔ **خطأ:** لم يتم إدخال مفتاح GLM."
+            yield "⛔ **خطأ:** الرجاء إدخال مفتاح Zed.ai."
             return
     else:
-        # إعدادات Cerebras الافتراضية
-        url = "https://api.cerebras.ai/v1/chat/completions"
+        url = c_url
         api_key = c_key
         if not api_key:
-            yield "⛔ **خطأ:** لم يتم إدخال مفتاح Cerebras."
+            yield "⛔ **خطأ:** الرجاء إدخال مفتاح Cerebras."
             return
 
     headers = {
@@ -78,42 +107,38 @@ def stream_chat_debug(messages, selected_model, c_key, g_key):
     }
     
     data = {
-        "model": selected_model,
+        "model": model,
         "messages": messages,
         "stream": True,
-        "max_tokens": 1000
+        "max_tokens": 1500 
     }
     
     try:
         response = requests.post(url, headers=headers, json=data, stream=True)
         
-        # إذا كان هناك خطأ من السيرفر
         if response.status_code != 200:
-            error_details = response.text
             try:
-                error_json = response.json()
-                error_msg = error_json.get('error', {}).get('message', error_details)
-                yield f"⛔ **فشل الموديل:** {selected_model}\n\n**السبب:** {error_msg}"
+                err_json = response.json()
+                err_msg = err_json.get('error', {}).get('message', response.text)
+                yield f"⛔ **فشل الاتصال بـ {provider_name}:**\nرمز الخطأ: {response.status_code}\nالرسالة: {err_msg}"
             except:
-                yield f"⛔ **خطأ غير معروف:** رمز الحالة {response.status_code}\n{error_details}"
+                yield f"⛔ **خطأ غير معروف:** {response.text}"
             return
 
-        # معالجة البث (Streaming)
         for line in response.iter_lines():
             if line:
                 decoded = line.decode('utf-8').replace("data: ", "")
                 if decoded.strip() == "[DONE]": break
                 try:
                     chunk = json.loads(decoded)
-                    # GLM و Cerebras يشتركان في نفس هيكلية الرد تقريباً (OpenAI Compatible)
                     content = chunk['choices'][0]['delta'].get('content', '')
                     if content: yield content
                 except: continue
                 
     except Exception as e:
-        yield f"❌ خطأ في الاتصال بالإنترنت: {e}"
+        yield f"❌ **خطأ في الشبكة:** {e}"
 
-# --- 5. التشغيل ---
+# --- 5. واجهة المحادثة ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -121,7 +146,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("اكتب رسالتك هنا..."):
+if prompt := st.chat_input("اكتب رسالتك..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -130,12 +155,14 @@ if prompt := st.chat_input("اكتب رسالتك هنا..."):
         response_holder = st.empty()
         full_text = ""
         
-        # تمرير المفاتيح والموديل المختار للدالة
         stream_gen = stream_chat_debug(
             st.session_state.messages, 
             selected_model, 
+            provider,
             cerebras_key, 
-            glm_key
+            zed_key,
+            cerebras_url,
+            default_zed_url  # استخدام المتغير الصحيح
         )
         
         for chunk in stream_gen:
@@ -144,5 +171,6 @@ if prompt := st.chat_input("اكتب رسالتك هنا..."):
         
         response_holder.markdown(full_text)
         
-        if "⛔" not in full_text:
+        if "⛔" not in full_text and "❌" not in full_text:
             st.session_state.messages.append({"role": "assistant", "content": full_text})
+
