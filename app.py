@@ -1,176 +1,284 @@
+"""
+🤖 تطبيق Streamlit لاستخدام GLM API
+جميع النماذج المتاحة من Zhipu AI
+"""
+
 import streamlit as st
-import requests
-import json
+from openai import OpenAI
+import time
 
-# --- 1. إعدادات الصفحة ---
-st.set_page_config(page_title="AI Debugger (Cerebras + GLM-5)", page_icon="🧪")
+# ==================== إعدادات الصفحة ====================
+st.set_page_config(
+    page_title="GLM Chat - محادثة ذكية",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# تخصيص CSS
-st.markdown("""
-<style>
-    .stChatMessage { direction: rtl; text-align: right; }
-    .stTextInput > div > div > input { direction: rtl; text-align: right; }
-    .stSelectbox > div > div > div { direction: rtl; }
-    .stExpander { direction: rtl; }
-</style>
-""", unsafe_allow_html=True)
+# ==================== النماذج المتاحة ====================
+GLM_MODELS = {
+    "glm-4-plus": {
+        "name": "GLM-4 Plus ⭐",
+        "description": "الأحدث والأقوى - أداء متفوق",
+        "max_tokens": 128000,
+        "recommended": True
+    },
+    "glm-4": {
+        "name": "GLM-4",
+        "description": "نموذج متعدد الاستخدامات",
+        "max_tokens": 128000,
+        "recommended": False
+    },
+    "glm-4-air": {
+        "name": "GLM-4 Air 🚀",
+        "description": "سريع وفعال للمهام اليومية",
+        "max_tokens": 128000,
+        "recommended": False
+    },
+    "glm-4-flash": {
+        "name": "GLM-4 Flash ⚡",
+        "description": "الأسرع - مثالي للردود السريعة",
+        "max_tokens": 128000,
+        "recommended": False
+    },
+    "glm-4-long": {
+        "name": "GLM-4 Long 📚",
+        "description": "للنصوص الطويلة والوثائق",
+        "max_tokens": 1024000,
+        "recommended": False
+    },
+    "glm-3-turbo": {
+        "name": "GLM-3 Turbo",
+        "description": "نموذج الجيل السابق - اقتصادي",
+        "max_tokens": 32000,
+        "recommended": False
+    }
+}
 
-st.title("🧪 فحص موديلات (Cerebras + GLM-5)")
-
-# --- 2. إعداد المفاتيح والروابط ---
+# ==================== إعدادات الشريط الجانبي ====================
 with st.sidebar:
-    st.header("🔑 إعدادات المفاتيح")
+    st.title("⚙️ إعدادات")
     
-    # 1. مفتاح Cerebras
-    try:
-        cerebras_key = st.secrets["CEREBRAS_API_KEY"]
-    except:
-        cerebras_key = st.text_input("مفتاح Cerebras API:", type="password")
-
-    # 2. مفتاح Zed.ai / GLM
-    try:
-        zed_key = st.secrets["ZED_API_KEY"]
-    except:
-        zed_key = st.text_input("مفتاح Zed.ai API:", type="password")
-
-    st.markdown("---")
+    # API Key
+    api_key = st.text_input(
+        "🔑 API Key",
+        value="f238665f81e44fad90c96cee0220b018.UnH1zIyvieg0zAnj",
+        type="password",
+        help="أدخل API Key الخاص بك من open.bigmodel.cn"
+    )
     
-    # إعدادات الروابط
-    with st.expander("⚙️ إعدادات الروابط (Base URLs)"):
-        # ملاحظة: إذا كنت تستخدم chat.z.ai، قد يكون الرابط مختلفاً عن الرابط الرسمي
-        # الرابط الرسمي هو: https://open.bigmodel.cn/api/paas/v4/chat/completions
-        # رابط chat.z.ai المتوقع (جرب هذا إذا لم يعمل الرسمي): https://chat.z.ai/api/v1/chat/completions
-        
-        default_zed_url = st.text_input(
-            "رابط Zed.ai / GLM:", 
-            value="https://open.bigmodel.cn/api/paas/v4/chat/completions",
-            help="إذا لم يعمل، جرب: https://chat.z.ai/api/v1/chat/completions"
+    st.divider()
+    
+    # اختيار النموذج
+    st.subheader("🧠 اختيار النموذج")
+    
+    # ترتيب النماذج (الموصى بها أولاً)
+    sorted_models = sorted(GLM_MODELS.items(), key=lambda x: not x[1]["recommended"])
+    
+    model_options = [f"{v['name']}" for k, v in sorted_models]
+    model_keys = [k for k, v in sorted_models]
+    
+    selected_model_index = st.selectbox(
+        "اختر النموذج:",
+        range(len(model_options)),
+        format_func=lambda i: model_options[i]
+    )
+    selected_model = model_keys[selected_model_index]
+    model_info = GLM_MODELS[selected_model]
+    
+    st.caption(f"📝 {model_info['description']}")
+    st.caption(f"📊 الحد الأقصى: {model_info['max_tokens']:,} tokens")
+    
+    st.divider()
+    
+    # إعدادات متقدمة
+    st.subheader("🎛️ إعدادات متقدمة")
+    
+    with st.expander("🔧 تخصيص المعاملات", expanded=False):
+        temperature = st.slider(
+            "🌡️ Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.7,
+            step=0.1,
+            help="قيم أعلى = إجابات أكثر إبداعاً"
         )
         
-        cerebras_url = "https://api.cerebras.ai/v1/chat/completions"
-
-# --- 3. اختيار الموديل (تحديث القائمة حسب الصورة) ---
-with st.sidebar:
-    st.header("🤖 اختيار الموديل")
-    
-    model_options = {
-        "Cerebras": [
-            "llama-3.3-70b",
-            "llama3.1-8b",
-            "qwen-3-32b"
-        ],
-        "Zed.ai (GLM)": [
-            "glm-5",           # ✅ الجديد (Flagship)
-            "glm-4.7",         # ✅ موديل قوي
-            "glm-4.6",         # ✅ كلاسيكي عالي الأداء
-            "glm-4-plus",      # القديم القوي
-            "glm-4-air",       # سريع
-            "glm-4-flash"      # اقتصادي
-        ]
-    }
-    
-    provider = st.selectbox("المزود:", list(model_options.keys()))
-    
-    # خيار لإدخال اسم موديل يدوياً في حالة ظهور موديلات جديدة
-    selected_model_dropdown = st.selectbox("الموديل:", model_options[provider])
-    use_manual = st.checkbox("كتابة اسم الموديل يدوياً؟")
-    
-    if use_manual:
-        selected_model = st.text_input("اكتب اسم الموديل (مثال: glm-4.6v):", value=selected_model_dropdown)
-    else:
-        selected_model = selected_model_dropdown
-
-    if st.button("🗑️ مسح الذاكرة"):
-        st.session_state.messages = []
-        st.rerun()
-
-# --- 4. دالة الاتصال الموحدة ---
-def stream_chat_debug(messages, model, provider_name, c_key, z_key, c_url, z_url):
-    
-    # تحديد الإعدادات
-    if provider_name == "Zed.ai (GLM)":
-        url = z_url
-        api_key = z_key
-        if not api_key:
-            yield "⛔ **خطأ:** الرجاء إدخال مفتاح Zed.ai."
-            return
-    else:
-        url = c_url
-        api_key = c_key
-        if not api_key:
-            yield "⛔ **خطأ:** الرجاء إدخال مفتاح Cerebras."
-            return
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    data = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "max_tokens": 1500 
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=data, stream=True)
+        top_p = st.slider(
+            "🎯 Top P",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.9,
+            step=0.05,
+            help="تنويع الإجابات"
+        )
         
-        if response.status_code != 200:
-            try:
-                err_json = response.json()
-                err_msg = err_json.get('error', {}).get('message', response.text)
-                yield f"⛔ **فشل الاتصال بـ {provider_name}:**\nرمز الخطأ: {response.status_code}\nالرسالة: {err_msg}"
-            except:
-                yield f"⛔ **خطأ غير معروف:** {response.text}"
-            return
+        max_tokens = st.slider(
+            "📏 Max Tokens",
+            min_value=100,
+            max_value=min(4096, model_info["max_tokens"]),
+            value=2048,
+            step=100,
+            help="الحد الأقصى لطول الرد"
+        )
+        
+        stream_response = st.checkbox(
+            "🌊 Stream Mode",
+            value=True,
+            help="عرض الرد تدريجياً"
+        )
+    
+    st.divider()
+    
+    # System Prompt
+    st.subheader("💬 System Prompt")
+    system_prompt = st.text_area(
+        "تعليمات النظام:",
+        value="أنت مساعد ذكي ومفيد. أجب باللغة العربية إلا إذا طُلب منك غير ذلك.",
+        height=100
+    )
+    
+    st.divider()
+    
+    # أزرار التحكم
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🗑️ مسح المحادثة", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+    with col2:
+        if st.button("🔄 إعادة تعيين", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+    
+    # معلومات
+    st.divider()
+    st.markdown("""
+    ### 📖 معلومات
+    
+    **GLM** هي نماذج ذكاء اصطناعي من **Zhipu AI**
+    
+    🔗 [open.bigmodel.cn](https://open.bigmodel.cn)
+    
+    ---
+    *تم التطوير بواسطة GLM API*
+    """)
 
-        for line in response.iter_lines():
-            if line:
-                decoded = line.decode('utf-8').replace("data: ", "")
-                if decoded.strip() == "[DONE]": break
-                try:
-                    chunk = json.loads(decoded)
-                    content = chunk['choices'][0]['delta'].get('content', '')
-                    if content: yield content
-                except: continue
-                
-    except Exception as e:
-        yield f"❌ **خطأ في الشبكة:** {e}"
+# ==================== الوظائف المساعدة ====================
 
-# --- 5. واجهة المحادثة ---
+def get_client(api_key: str) -> OpenAI:
+    """إنشاء عميل OpenAI متوافق مع GLM"""
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://open.bigmodel.cn/api/paas/v4/"
+    )
+
+def stream_chat(client: OpenAI, messages: list, model: str, **kwargs):
+    """بث الرد تدريجياً"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=kwargs.get("temperature", 0.7),
+        top_p=kwargs.get("top_p", 0.9),
+        max_tokens=kwargs.get("max_tokens", 2048),
+        stream=True
+    )
+    return response
+
+def normal_chat(client: OpenAI, messages: list, model: str, **kwargs):
+    """الحصول على الرد كاملاً"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=kwargs.get("temperature", 0.7),
+        top_p=kwargs.get("top_p", 0.9),
+        max_tokens=kwargs.get("max_tokens", 2048),
+        stream=False
+    )
+    return response
+
+# ==================== تهيئة المحادثة ====================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+# ==================== واجهة المحادثة ====================
+st.title("🤖 GLM Chat - محادثة ذكية")
+st.caption(f"النموذج الحالي: **{model_info['name']}** | {model_info['description']}")
 
-if prompt := st.chat_input("اكتب رسالتك..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# عرض الرسائل السابقة
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    with st.chat_message("assistant"):
-        response_holder = st.empty()
-        full_text = ""
+# حقل الإدخال
+if prompt := st.chat_input("اكتب رسالتك هنا..."):
+    # التحقق من API Key
+    if not api_key:
+        st.error("❌ الرجاء إدخال API Key")
+    else:
+        # إضافة رسالة المستخدم
+        st.session_state.messages.append({"role": "user", "content": prompt})
         
-        stream_gen = stream_chat_debug(
-            st.session_state.messages, 
-            selected_model, 
-            provider,
-            cerebras_key, 
-            zed_key,
-            cerebras_url,
-            default_zed_url  # استخدام المتغير الصحيح
-        )
+        with st.chat_message("user"):
+            st.markdown(prompt)
         
-        for chunk in stream_gen:
-            full_text += chunk
-            response_holder.markdown(full_text + "▌")
+        # إعداد الرسائل للإرسال
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(st.session_state.messages)
         
-        response_holder.markdown(full_text)
-        
-        if "⛔" not in full_text and "❌" not in full_text:
-            st.session_state.messages.append({"role": "assistant", "content": full_text})
+        # الحصول على الرد
+        with st.chat_message("assistant"):
+            try:
+                client = get_client(api_key)
+                
+                if stream_response:
+                    # وضع البث
+                    message_placeholder = st.empty()
+                    full_response = ""
+                    
+                    response = stream_chat(
+                        client, messages, selected_model,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens
+                    )
+                    
+                    for chunk in response:
+                        if chunk.choices[0].delta.content:
+                            full_response += chunk.choices[0].delta.content
+                            message_placeholder.markdown(full_response + "▌")
+                    
+                    message_placeholder.markdown(full_response)
+                else:
+                    # الوضع العادي
+                    with st.spinner("جاري التفكير..."):
+                        response = normal_chat(
+                            client, messages, selected_model,
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens
+                        )
+                    
+                    full_response = response.choices[0].message.content
+                    st.markdown(full_response)
+                
+                # إضافة الرد للمحادثة
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                
+            except Exception as e:
+                st.error(f"❌ حدث خطأ: {str(e)}")
+                if "401" in str(e):
+                    st.warning("⚠️ تحقق من صحة API Key")
+                elif "429" in str(e):
+                    st.warning("⚠️ تم تجاوز حد الطلبات، الرجاء المحاولة لاحقاً")
 
+# ==================== تذييل ====================
+st.divider()
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.caption(f"📊 عدد الرسائل: {len([m for m in st.session_state.messages if m['role'] == 'user'])}")
+with col2:
+    st.caption(f"🧠 النموذج: {selected_model}")
+with col3:
+    st.caption("💎 Powered by GLM API")
