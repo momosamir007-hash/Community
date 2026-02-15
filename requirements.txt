@@ -1,4 +1,4 @@
-
+openai
 streamlit
 python-docx
 transformers
