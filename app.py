@@ -1,13 +1,21 @@
+
 import streamlit as st
 import requests
 import json
 import time
+import sqlite3
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from collections import Counter
+from datetime import datetime
+import hashlib
+import re
 
 # ==========================================
-# 1. إعدادات الصفحة والتصميم
+# 1. إعدادات الصفحة والتصميم مع الوضع الليلي
 # ==========================================
 st.set_page_config(
     page_title="CineMate Pro - الناقد السينمائي",
@@ -16,19 +24,28 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# تخصيص CSS للغة العربية
-st.markdown("""
-<style>
-    .main {direction: rtl; text-align: right;}
-    .stTextInput > div > div > input {text-align: right;}
-    h1, h2, h3, p {font-family: 'Tahoma', sans-serif;}
-    .metric-card {background-color: #f0f2f6; padding: 15px; border-radius: 10px; border: 1px solid #ddd; text-align: center;}
-    .tmdb-card {background-color: #0e1a2b; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px;}
-    .comparison-table {background-color: #f9f9f9; border-radius: 10px; padding: 10px;}
-    .cast-card {display: inline-block; text-align: center; margin: 5px; width: 100px;}
-    .cast-card img {border-radius: 50%; width: 80px; height: 80px; object-fit: cover;}
-</style>
-""", unsafe_allow_html=True)
+# تخصيص CSS للغة العربية والوضع الليلي
+def apply_theme(theme):
+    if theme == "داكن":
+        bg_color = "#0e1117"
+        text_color = "#fafafa"
+        card_bg = "#1e2130"
+    else:
+        bg_color = "#ffffff"
+        text_color = "#31333F"
+        card_bg = "#f0f2f6"
+    
+    st.markdown(f"""
+    <style>
+        .main {{direction: rtl; text-align: right; background-color: {bg_color}; color: {text_color};}}
+        .stTextInput > div > div > input {{text-align: right;}}
+        h1, h2, h3, p {{font-family: 'Tahoma', sans-serif;}}
+        .metric-card {{background-color: {card_bg}; padding: 15px; border-radius: 10px; border: 1px solid #ddd; text-align: center;}}
+        .tmdb-card {{background-color: #0e1a2b; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px;}}
+        .comparison-table {{background-color: {card_bg}; border-radius: 10px; padding: 10px;}}
+        .stButton>button {{width: 100%;}}
+    </style>
+    """, unsafe_allow_html=True)
 
 # ==========================================
 # 2. هيكلية البيانات (Pydantic)
@@ -40,6 +57,7 @@ class MovieInfo(BaseModel):
     director: str = Field(..., description="Director name")
     duration: str = Field(..., description="Duration (e.g., 2h 15m)")
     genre: List[str] = Field(..., description="List of genres in Arabic")
+    type: str = Field("فيلم", description="فيلم أو مسلسل")
 
 class TechnicalAnalysis(BaseModel):
     screenplay: str = Field(..., description="Deep analysis of the plot and writing in Arabic")
@@ -62,169 +80,174 @@ class FullMovieReport(BaseModel):
     recommendation: Recommendation
 
 # ==========================================
-# 3. دوال مساعدة (TMDB Integration متقدم)
+# 3. قاعدة بيانات محلية (SQLite)
 # ==========================================
+def init_db():
+    conn = sqlite3.connect('cinemate.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS reports
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  title TEXT,
+                  arabic_title TEXT,
+                  director TEXT,
+                  genres TEXT,
+                  score REAL,
+                  year INTEGER,
+                  type TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+def save_report_to_db(report: FullMovieReport):
+    conn = sqlite3.connect('cinemate.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO reports (title, arabic_title, director, genres, score, year, type)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (report.info.original_title,
+               report.info.arabic_title,
+               report.info.director,
+               json.dumps(report.info.genre),
+               report.recommendation.score,
+               report.info.year,
+               report.info.type))
+    conn.commit()
+    conn.close()
+
+def get_reports_from_db(limit=50):
+    conn = sqlite3.connect('cinemate.db')
+    df = pd.read_sql_query("SELECT * FROM reports ORDER BY created_at DESC LIMIT ?", conn, params=(limit,))
+    conn.close()
+    # تحويل genres من JSON إلى قائمة
+    if not df.empty:
+        df['genres'] = df['genres'].apply(json.loads)
+    return df
+
+# تهيئة قاعدة البيانات
+init_db()
+
+# ==========================================
+# 4. دوال مساعدة (TMDB Integration مع تخزين مؤقت)
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_tmdb_data(api_key: str, movie_name: str):
-    """جلب بيانات غنية من TMDB: تفاصيل، طاقم، صور، توصيات، فيديوهات"""
+    """جلب بيانات إضافية من TMDB مع تخزين مؤقت"""
     if not api_key:
         return None
     try:
-        # بحث متعدد اللغات (إنجليزي + عربي)
         search_url = "https://api.themoviedb.org/3/search/movie"
         params = {
             "api_key": api_key,
             "query": movie_name,
-            "language": "ar-SA",  # نحاول العربية أولاً
-            "include_adult": False
+            "language": "ar-SA"
         }
         response = requests.get(search_url, params=params)
         response.raise_for_status()
         data = response.json()
-        
-        if not data['results']:
-            # جرب بالإنجليزية إذا لم تكن هناك نتائج عربية
-            params["language"] = "en-US"
-            response = requests.get(search_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            if not data['results']:
-                return None
-        
-        movie = data['results'][0]
-        movie_id = movie['id']
-        
-        # جلب التفاصيل الكاملة
-        details_url = f"https://api.themoviedb.org/3/movie/{movie_id}"
-        details_params = {
-            "api_key": api_key,
-            "language": "ar-SA",
-            "append_to_response": "credits,videos,recommendations,release_dates"
-        }
-        details_response = requests.get(details_url, params=details_params)
-        details_response.raise_for_status()
-        details = details_response.json()
-        
-        # معالجة البيانات
-        poster = f"https://image.tmdb.org/t/p/w500{details['poster_path']}" if details.get('poster_path') else None
-        backdrop = f"https://image.tmdb.org/t/p/original{details['backdrop_path']}" if details.get('backdrop_path') else None
-        
-        # طاقم التمثيل (أول 10 مع صور)
-        cast = []
-        for actor in details.get('credits', {}).get('cast', [])[:10]:
-            cast.append({
-                'name': actor['name'],
-                'character': actor['character'],
-                'profile': f"https://image.tmdb.org/t/p/w185{actor['profile_path']}" if actor.get('profile_path') else None,
-                'order': actor['order']
-            })
-        
-        # المخرج والكتاب
-        director = None
-        writers = []
-        for crew in details.get('credits', {}).get('crew', []):
-            if crew['job'] == 'Director':
-                director = crew['name']
-            elif crew['job'] in ['Writer', 'Screenplay', 'Author']:
-                writers.append(crew['name'])
-        
-        # فيديوهات (trailer)
-        videos = []
-        for video in details.get('videos', {}).get('results', []):
-            if video['type'] == 'Trailer' and video['site'] == 'YouTube':
-                videos.append({
-                    'key': video['key'],
-                    'name': video['name']
-                })
-        
-        # توصيات من TMDB
-        recommendations = []
-        for rec in details.get('recommendations', {}).get('results', [])[:5]:
-            recommendations.append({
-                'title': rec['title'],
-                'poster': f"https://image.tmdb.org/t/p/w200{rec['poster_path']}" if rec.get('poster_path') else None,
-                'year': rec.get('release_date', '')[:4] if rec.get('release_date') else None,
-                'id': rec['id']
-            })
-        
-        # تصنيف المحتوى (PG-13, R, إلخ) حسب البلد
-        certification = None
-        for release in details.get('release_dates', {}).get('results', []):
-            if release['iso_3166_1'] == 'US':  # نأخذ التصنيف الأمريكي كمرجع
-                for rel in release['release_dates']:
-                    if rel.get('certification'):
-                        certification = rel['certification']
-                        break
-                if certification:
+        if data['results']:
+            movie = data['results'][0]
+            movie_id = movie['id']
+            
+            # جلب تفاصيل إضافية (الممثلين، المخرج، الفيديو)
+            credits_url = f"https://api.themoviedb.org/3/movie/{movie_id}/credits"
+            credits_response = requests.get(credits_url, params={"api_key": api_key})
+            credits_response.raise_for_status()
+            credits = credits_response.json()
+            
+            # جلب الفيديو (trailer)
+            videos_url = f"https://api.themoviedb.org/3/movie/{movie_id}/videos"
+            videos_response = requests.get(videos_url, params={"api_key": api_key})
+            videos_response.raise_for_status()
+            videos = videos_response.json()
+            
+            trailer_key = None
+            for vid in videos.get('results', []):
+                if vid['type'] == 'Trailer' and vid['site'] == 'YouTube':
+                    trailer_key = vid['key']
                     break
-        
-        return {
-            'id': movie_id,
-            'poster': poster,
-            'backdrop': backdrop,
-            'rating': details.get('vote_average'),
-            'votes': details.get('vote_count'),
-            'overview': details.get('overview'),
-            'tagline': details.get('tagline'),
-            'budget': details.get('budget'),
-            'revenue': details.get('revenue'),
-            'runtime': details.get('runtime'),
-            'original_language': details.get('original_language'),
-            'production_countries': [c['name'] for c in details.get('production_countries', [])],
-            'genres': [g['name'] for g in details.get('genres', [])],
-            'cast': cast,
-            'director': director,
-            'writers': writers,
-            'videos': videos,
-            'recommendations': recommendations,
-            'certification': certification,
-            'homepage': details.get('homepage')
-        }
+            
+            # استخراج أبرز 5 ممثلين
+            cast = [actor['name'] for actor in credits.get('cast', [])[:5]]
+            
+            # استخراج المخرج
+            director = next((crew['name'] for crew in credits.get('crew', []) if crew['job'] == 'Director'), None)
+            
+            # جلب توصيات الأفلام المشابهة من TMDB
+            recommendations_url = f"https://api.themoviedb.org/3/movie/{movie_id}/recommendations"
+            recommendations_response = requests.get(recommendations_url, params={"api_key": api_key})
+            recommendations_response.raise_for_status()
+            recommendations_data = recommendations_response.json()
+            similar_tmdb = [rec['title'] for rec in recommendations_data.get('results', [])[:3]]
+            
+            return {
+                'poster': f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie.get('poster_path') else None,
+                'rating': movie.get('vote_average'),
+                'overview': movie.get('overview'),
+                'cast': cast,
+                'director': director,
+                'trailer_key': trailer_key,
+                'similar_tmdb': similar_tmdb,
+                'backdrop': f"https://image.tmdb.org/t/p/w1280{movie.get('backdrop_path')}" if movie.get('backdrop_path') else None
+            }
     except Exception as e:
         st.warning(f"تعذر جلب بيانات TMDB: {e}")
+    return None
+
+@st.cache_data(ttl=3600)
+def fetch_tv_data(api_key: str, tv_name: str):
+    """جلب بيانات مسلسل من TMDB"""
+    if not api_key:
         return None
-
-def format_currency(amount):
-    """تنسيق الأرقام كعملة (دولار)"""
-    if not amount or amount == 0:
-        return "غير متوفر"
-    return f"${amount:,.0f}"
+    try:
+        search_url = "https://api.themoviedb.org/3/search/tv"
+        params = {
+            "api_key": api_key,
+            "query": tv_name,
+            "language": "ar-SA"
+        }
+        response = requests.get(search_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if data['results']:
+            tv = data['results'][0]
+            tv_id = tv['id']
+            
+            credits_url = f"https://api.themoviedb.org/3/tv/{tv_id}/credits"
+            credits_response = requests.get(credits_url, params={"api_key": api_key})
+            credits_response.raise_for_status()
+            credits = credits_response.json()
+            
+            videos_url = f"https://api.themoviedb.org/3/tv/{tv_id}/videos"
+            videos_response = requests.get(videos_url, params={"api_key": api_key})
+            videos_response.raise_for_status()
+            videos = videos_response.json()
+            
+            trailer_key = None
+            for vid in videos.get('results', []):
+                if vid['type'] == 'Trailer' and vid['site'] == 'YouTube':
+                    trailer_key = vid['key']
+                    break
+            
+            cast = [actor['name'] for actor in credits.get('cast', [])[:5]]
+            
+            return {
+                'poster': f"https://image.tmdb.org/t/p/w500{tv['poster_path']}" if tv.get('poster_path') else None,
+                'rating': tv.get('vote_average'),
+                'overview': tv.get('overview'),
+                'cast': cast,
+                'trailer_key': trailer_key,
+                'backdrop': f"https://image.tmdb.org/t/p/w1280{tv.get('backdrop_path')}" if tv.get('backdrop_path') else None
+            }
+    except Exception as e:
+        st.warning(f"تعذر جلب بيانات المسلسل: {e}")
+    return None
 
 # ==========================================
-# 4. محرك التحليل (Cerebras)
+# 5. محرك التحليل (Cerebras) مع إعادة محاولة
 # ==========================================
-def analyze_movie(api_key: str, movie_name: str, comparison_mode: bool = False, second_movie: str = None) -> Optional[FullMovieReport]:
-    """
-    يتصل بـ Cerebras API ويحلل الفيلم
-    إذا كان comparison_mode = True، يطلب تحليل فيلمين معاً
-    """
+def call_cerebras_with_retry(api_key, messages, max_retries=3, delay=2):
+    """استدعاء API مع إعادة محاولة تلقائية"""
     API_URL = "https://api.cerebras.ai/v1/chat/completions"
     MODEL = "llama-3.3-70b"
-    
-    schema_json = json.dumps(FullMovieReport.model_json_schema(), indent=2)
-    
-    if comparison_mode and second_movie:
-        system_content = f"""
-        You are an elite Arab Film Critic. Compare the two movies: '{movie_name}' and '{second_movie}'.
-        First, analyze each movie separately according to the schema, then provide a comparison table.
-        Output MUST be a JSON object with keys: 'movie1', 'movie2', 'comparison'.
-        Each movie should follow the FullMovieReport schema, and 'comparison' should be a dict with keys: 'better_plot', 'better_acting', 'better_visuals', 'better_music', 'overall_winner', 'verdict'.
-        Language: Arabic.
-        """
-        user_content = f"Compare {movie_name} and {second_movie} in depth."
-    else:
-        system_content = f"""
-        You are an elite Arab Film Critic (like Youssef Chahine mixed with Roger Ebert).
-        Analyze the requested movie/series deeply.
-        Language: High-quality Arabic (Fusha).
-        You MUST output strict JSON following this schema:
-        {schema_json}
-        """
-        user_content = f"Analyze: {movie_name}"
-    
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content}
-    ]
     
     payload = {
         "model": MODEL,
@@ -239,265 +262,400 @@ def analyze_movie(api_key: str, movie_name: str, comparison_mode: bool = False, 
         "Authorization": f"Bearer {api_key}"
     }
     
-    try:
-        response = requests.post(API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        content = data['choices'][0]['message']['content']
-        parsed_data = json.loads(content)
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            content = data['choices'][0]['message']['content']
+            
+            # محاولة استخراج JSON إذا كان الرد مختلطاً
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group()
+            
+            return json.loads(content)
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(delay * (attempt + 1))  # تأخير متزايد
+        except json.JSONDecodeError as e:
+            if attempt == max_retries - 1:
+                raise ValueError(f"فشل تحليل JSON: {e}\nالرد: {content}")
+            time.sleep(delay)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def analyze_movie(api_key: str, movie_name: str, content_type: str = "فيلم", comparison_mode: bool = False, other_movies: List[str] = None) -> Any:
+    """
+    يحلل الفيلم أو المسلسل مع دعم المقارنة المتعددة
+    """
+    schema_json = json.dumps(FullMovieReport.model_json_schema(), indent=2)
+    
+    if comparison_mode and other_movies:
+        # قائمة الأفلام للمقارنة
+        movies_list = [movie_name] + other_movies
+        movies_str = "، ".join(movies_list)
         
-        if comparison_mode and second_movie:
-            return parsed_data  # سيكون قاموساً بالمقارنة
+        system_content = f"""
+        You are an elite Arab Film Critic. Compare the following {content_type}s: {movies_str}.
+        First, analyze each {content_type} separately according to the schema, then provide a comparison table.
+        Output MUST be a JSON object with keys: 'movies' (list of FullMovieReport for each), and 'comparison' (dict with keys: 'better_plot', 'better_acting', 'better_visuals', 'better_music', 'overall_winner', 'verdict').
+        Language: Arabic.
+        """
+        user_content = f"Compare these {content_type}s in depth."
+    else:
+        system_content = f"""
+        You are an elite Arab Film Critic (like Youssef Chahine mixed with Roger Ebert).
+        Analyze the requested {content_type} deeply.
+        Language: High-quality Arabic (Fusha).
+        You MUST output strict JSON following this schema:
+        {schema_json}
+        """
+        user_content = f"Analyze: {movie_name}"
+    
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content}
+    ]
+    
+    try:
+        result = call_cerebras_with_retry(api_key, messages)
+        
+        if comparison_mode and other_movies:
+            # تحويل كل تقرير إلى FullMovieReport
+            if 'movies' in result:
+                result['movies'] = [FullMovieReport(**m) for m in result['movies']]
+            return result
         else:
-            return FullMovieReport(**parsed_data)
+            return FullMovieReport(**result)
     except Exception as e:
         st.error(f"حدث خطأ أثناء الاتصال: {str(e)}")
-        if 'response' in locals():
-            st.code(response.text)
         return None
 
 # ==========================================
-# 5. دوال التوصيات الذكية
+# 6. دوال التوصيات الذكية (محسّنة)
 # ==========================================
-def update_recommendations(new_report):
-    """تحديث سجل التوصيات بناءً على التحليل الجديد"""
-    if 'reports_history' not in st.session_state:
-        st.session_state['reports_history'] = []
+def get_smart_recommendations(current_report: FullMovieReport, tmdb_data=None, top_n=3):
+    """توليد توصيات من TMDB أو من التاريخ المحلي"""
+    recommendations = []
     
-    # نضيف التقرير الجديد مع بعض المعلومات المبسطة
-    st.session_state['reports_history'].append({
-        'title': new_report.info.original_title,
-        'arabic_title': new_report.info.arabic_title,
-        'director': new_report.info.director,
-        'genres': new_report.info.genre,
-        'score': new_report.recommendation.score
-    })
+    # 1. إذا توفرت توصيات TMDB
+    if tmdb_data and tmdb_data.get('similar_tmdb'):
+        for title in tmdb_data['similar_tmdb'][:top_n]:
+            recommendations.append({"title": title, "source": "TMDB"})
+    
+    # 2. استكمال من قاعدة البيانات المحلية
+    if len(recommendations) < top_n:
+        df = get_reports_from_db(limit=20)
+        if not df.empty:
+            current_genres = set(current_report.info.genre)
+            current_director = current_report.info.director
+            
+            # حساب التشابه
+            scores = []
+            for _, row in df.iterrows():
+                if row['title'] == current_report.info.original_title:
+                    continue
+                genres = set(row['genres'])
+                genre_sim = len(current_genres & genres) / max(len(current_genres), len(genres)) if current_genres and genres else 0
+                director_match = 1 if current_director == row['director'] else 0
+                total_score = genre_sim * 0.6 + director_match * 0.4
+                scores.append((total_score, row))
+            
+            scores.sort(reverse=True, key=lambda x: x[0])
+            for score, row in scores[:top_n - len(recommendations)]:
+                recommendations.append({
+                    "title": row['arabic_title'],
+                    "director": row['director'],
+                    "score": row['score'],
+                    "source": "محلي"
+                })
+    
+    return recommendations
 
-def get_smart_recommendations(current_report, top_n=3):
-    """توليد توصيات بناءً على تشابه الأنواع والمخرج"""
-    if 'reports_history' not in st.session_state or len(st.session_state['reports_history']) < 2:
-        return []
-    
-    history = st.session_state['reports_history']
-    current_genres = set(current_report.info.genre)
-    current_director = current_report.info.director
-    
-    scores = []
-    for idx, item in enumerate(history):
-        if item['title'] == current_report.info.original_title:
-            continue  # نتخطى الفيلم الحالي
+# ==========================================
+# 7. دوال التصدير والمشاركة
+# ==========================================
+def generate_markdown_report(report: FullMovieReport, tmdb_data=None):
+    """توليد تقرير بصيغة Markdown"""
+    md = f"""
+# تقرير فيلم: {report.info.arabic_title} ({report.info.original_title})
+**السنة:** {report.info.year} | **المخرج:** {report.info.director} | **التقييم:** {report.recommendation.score}/10
+**النوع:** {', '.join(report.info.genre)}
+
+## التحليل الفني
+### السيناريو والحبكة
+{report.analysis.screenplay}
+
+### الأداء التمثيلي
+{report.analysis.acting}
+
+### الإخراج والبصريات
+{report.analysis.visuals}
+
+### الموسيقى والصوت
+{report.analysis.music}
+
+### الرمزية والعمق
+{report.analysis.symbolism}
+
+## الحكم
+**نقاط القوة:**
+"""
+    for p in report.recommendation.pros:
+        md += f"- {p}\n"
+    md += "**نقاط الضعف:**\n"
+    for c in report.recommendation.cons:
+        md += f"- {c}\n"
+    md += f"""
+**الحكم النهائي:** {report.recommendation.final_verdict}
+**متوفر على:** {', '.join(report.recommendation.streaming_on)}
+**أفلام مشابهة:** {', '.join(report.recommendation.similar_movies)}
+"""
+    if tmdb_data:
+        md += f"\n**تقييم TMDB:** {tmdb_data.get('rating')}/10\n"
+        if tmdb_data.get('cast'):
+            md += f"**الممثلون:** {', '.join(tmdb_data['cast'])}\n"
+    return md
+
+# ==========================================
+# 8. واجهة التطبيق الرئيسية
+# ==========================================
+def main():
+    # إعدادات جانبية
+    with st.sidebar:
+        st.image("https://cdn-icons-png.flaticon.com/512/2503/2503508.png", width=100)
+        st.title("إعدادات المحرك")
         
-        # حساب درجة التشابه
-        genre_similarity = len(current_genres & set(item['genres'])) / max(len(current_genres), len(item['genres']))
-        director_match = 1 if current_director == item['director'] else 0
-        total_score = genre_similarity * 0.7 + director_match * 0.3
+        # استخدام st.secrets كمصدر رئيسي للمفاتيح
+        cerebras_key = None
+        tmdb_key = None
         
-        scores.append((total_score, item))
+        if "cerebras_key" in st.secrets:
+            cerebras_key = st.secrets["cerebras_key"]
+            st.success("✅ تم تحميل مفتاح Cerebras من الأسرار")
+        else:
+            cerebras_key = st.text_input("مفتاح Cerebras API", type="password", help="يبدأ بـ csk-")
+        
+        if "tmdb_key" in st.secrets:
+            tmdb_key = st.secrets["tmdb_key"]
+            st.success("✅ تم تحميل مفتاح TMDB من الأسرار")
+        else:
+            tmdb_key = st.text_input("مفتاح TMDB API (اختياري)", type="password", help="لجلب بيانات إضافية")
+        
+        # تخزين المفاتيح في الجلسة
+        if cerebras_key:
+            st.session_state['cerebras_key'] = cerebras_key
+        if tmdb_key:
+            st.session_state['tmdb_key'] = tmdb_key
+        
+        # اختيار الوضع (ليلي/نهاري)
+        theme = st.selectbox("الوضع", ["فاتح", "داكن"], index=0)
+        st.session_state['theme'] = theme
+        apply_theme(theme)
+        
+        # نوع المحتوى
+        content_type = st.selectbox("نوع المحتوى", ["فيلم", "مسلسل"], index=0)
+        st.session_state['content_type'] = content_type
+        
+        # وضع المقارنة
+        comparison_mode = st.checkbox("🔁 تفعيل وضع المقارنة", value=False)
+        st.session_state['comparison_mode'] = comparison_mode
+        
+        if comparison_mode:
+            num_movies = st.number_input("عدد الأفلام للمقارنة", min_value=2, max_value=5, value=2, step=1)
+            st.session_state['num_movies'] = num_movies
+        
+        st.info("💡 يستخدم Llama-3.3-70b عبر Cerebras مع إعادة محاولة.")
+        
+        # عرض تاريخ التحليلات
+        st.markdown("---")
+        st.subheader("📜 آخر التحليلات")
+        df = get_reports_from_db(5)
+        if not df.empty:
+            for _, row in df.iterrows():
+                st.write(f"**{row['arabic_title']}** - {row['score']}/10")
+        
+        st.markdown("---")
+        st.write("Designed by: **AI Architect**")
     
-    # ترتيب تنازلي وأخذ الأعلى
-    scores.sort(reverse=True, key=lambda x: x[0])
-    return [item for score, item in scores[:top_n]]
-
-# ==========================================
-# 6. واجهة التطبيق
-# ==========================================
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2503/2503508.png", width=100)
-    st.title("إعدادات المحرك")
+    # التحقق من المفتاح الأساسي
+    if 'cerebras_key' not in st.session_state:
+        st.warning("⚠️ يرجى إدخال مفتاح Cerebras API في القائمة الجانبية للبدء.")
+        st.stop()
     
-    # مفتاح Cerebras
-    cerebras_key = st.text_input("مفتاح Cerebras API", type="password", help="يبدأ بـ csk-")
-    if cerebras_key:
-        st.session_state['cerebras_key'] = cerebras_key
+    # الواجهة الرئيسية
+    st.title("🎬 CineMate Pro")
+    st.subheader("منصة التحليل السينمائي المتقدمة")
     
-    # مفتاح TMDB (اختياري)
-    tmdb_key = st.text_input("مفتاح TMDB API (اختياري)", type="password", help="لجلب بيانات إضافية غنية")
-    if tmdb_key:
-        st.session_state['tmdb_key'] = tmdb_key
-    
-    # وضع المقارنة
-    st.session_state['comparison_mode'] = st.checkbox("🔁 تفعيل وضع المقارنة", value=False)
-    
-    st.info("💡 يستخدم Llama-3.3-70b عبر Cerebras.")
-    st.markdown("---")
-    st.write("Designed by: **AI Architect**")
-
-# التحقق من المفتاح الأساسي
-if 'cerebras_key' not in st.session_state:
-    st.warning("⚠️ يرجى إدخال مفتاح Cerebras API في القائمة الجانبية للبدء.")
-    st.stop()
-
-# الواجهة الرئيسية
-st.title("🎬 CineMate Pro")
-st.subheader("منصة التحليل السينمائي المتقدمة")
-
-# حقول الإدخال حسب الوضع
-if st.session_state.get('comparison_mode', False):
-    col1, col2 = st.columns(2)
-    with col1:
-        movie1 = st.text_input("الفيلم الأول:", placeholder="مثال: The Godfather")
-    with col2:
-        movie2 = st.text_input("الفيلم الثاني:", placeholder="مثال: Scarface")
-    analyze_btn = st.button("🔍 تحليل مقارن شامل", use_container_width=True)
-    movie_name = movie1
-    second_movie = movie2
-else:
-    movie_name = st.text_input("اسم الفيلم أو المسلسل:", placeholder="مثال: Interstellar")
-    second_movie = None
-    analyze_btn = st.button("🔍 تحليل شامل", use_container_width=True)
-
-# منطق العرض
-if analyze_btn:
+    # حقول الإدخال حسب الوضع
+    movies_list = []
     if st.session_state.get('comparison_mode', False):
-        if not movie1 or not movie2:
-            st.error("الرجاء إدخال اسمي الفيلمين للمقارنة.")
+        cols = st.columns(st.session_state.get('num_movies', 2))
+        for i, col in enumerate(cols):
+            with col:
+                movie = st.text_input(f"العمل {i+1}:", placeholder=f"مثال: Inception", key=f"movie_{i}")
+                if movie:
+                    movies_list.append(movie)
+        analyze_btn = st.button("🔍 تحليل مقارن شامل", use_container_width=True)
+    else:
+        movie_name = st.text_input("اسم الفيلم أو المسلسل:", placeholder="مثال: Interstellar", key="single_movie")
+        analyze_btn = st.button("🔍 تحليل شامل", use_container_width=True)
+        if movie_name:
+            movies_list = [movie_name]
+    
+    # تحليل شخصية (اختياري)
+    analyze_character = st.checkbox("🧑‍🎤 تحليل شخصية معينة", value=False)
+    character_name = None
+    if analyze_character:
+        character_name = st.text_input("اسم الشخصية:", placeholder="مثال: The Joker")
+    
+    # بدء التحليل
+    if analyze_btn and movies_list:
+        if not all(movies_list):
+            st.error("الرجاء إدخال جميع الأسماء.")
             st.stop()
-        with st.spinner(f"جاري المقارنة بين '{movie1}' و '{movie2}'..."):
-            comparison_result = analyze_movie(
-                st.session_state['cerebras_key'], 
-                movie1, 
-                comparison_mode=True, 
-                second_movie=movie2
+        
+        # شريط تقدم متعدد المراحل
+        progress_bar = st.progress(0, text="جاري تجهيز البيانات...")
+        
+        # مرحلة 1: جلب بيانات TMDB (إذا توفر المفتاح)
+        tmdb_datas = []
+        if 'tmdb_key' in st.session_state:
+            for i, movie in enumerate(movies_list):
+                progress_bar.progress((i+1)/(len(movies_list)*2), text=f"جلب بيانات TMDB لـ {movie}...")
+                if st.session_state['content_type'] == "فيلم":
+                    tmdb_data = fetch_tmdb_data(st.session_state['tmdb_key'], movie)
+                else:
+                    tmdb_data = fetch_tv_data(st.session_state['tmdb_key'], movie)
+                tmdb_datas.append(tmdb_data)
+        
+        # مرحلة 2: الاتصال بـ Cerebras
+        progress_bar.progress(0.5, text="جاري الاتصال بمحرك التحليل...")
+        
+        if st.session_state.get('comparison_mode', False):
+            # مقارنة متعددة
+            other_movies = movies_list[1:]
+            result = analyze_movie(
+                st.session_state['cerebras_key'],
+                movies_list[0],
+                content_type=st.session_state['content_type'],
+                comparison_mode=True,
+                other_movies=other_movies
             )
-            if comparison_result:
+            
+            if result and 'movies' in result:
+                progress_bar.progress(1.0, text="اكتمل!")
+                time.sleep(0.5)
+                progress_bar.empty()
+                
+                # حفظ التقارير في قاعدة البيانات
+                for report in result['movies']:
+                    save_report_to_db(report)
+                
                 # عرض المقارنة
                 st.markdown("---")
                 st.header("📊 نتيجة المقارنة")
                 
-                movie1_data = comparison_result.get('movie1')
-                movie2_data = comparison_result.get('movie2')
-                comparison = comparison_result.get('comparison', {})
+                # جدول المقارنة مع الرسوم البيانية
+                movies_reports = result['movies']
+                comparison = result.get('comparison', {})
                 
-                if movie1_data and movie2_data:
-                    # جدول المقارنة
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.subheader(f"🎬 {movie1_data['info']['arabic_title']}")
-                        st.metric("التقييم", f"{movie1_data['recommendation']['score']}/10")
-                    with col_b:
-                        st.subheader(f"🎬 {movie2_data['info']['arabic_title']}")
-                        st.metric("التقييم", f"{movie2_data['recommendation']['score']}/10")
-                    
-                    # جدول تفصيلي
-                    comparison_data = {
-                        'العنصر': ['القصة', 'الأداء التمثيلي', 'الإخراج', 'الموسيقى', 'الرمزية'],
-                        movie1_data['info']['arabic_title']: [
-                            movie1_data['analysis']['screenplay'][:100] + '...',
-                            movie1_data['analysis']['acting'][:100] + '...',
-                            movie1_data['analysis']['visuals'][:100] + '...',
-                            movie1_data['analysis']['music'][:100] + '...',
-                            movie1_data['analysis']['symbolism'][:100] + '...'
-                        ],
-                        movie2_data['info']['arabic_title']: [
-                            movie2_data['analysis']['screenplay'][:100] + '...',
-                            movie2_data['analysis']['acting'][:100] + '...',
-                            movie2_data['analysis']['visuals'][:100] + '...',
-                            movie2_data['analysis']['music'][:100] + '...',
-                            movie2_data['analysis']['symbolism'][:100] + '...'
-                        ]
-                    }
-                    st.table(comparison_data)
-                    
-                    # الحكم النهائي
-                    st.success(f"**الفائز الإجمالي:** {comparison.get('overall_winner', '')}")
-                    st.info(comparison.get('verdict', ''))
-    
-    else:  # وضع عادي
-        if not movie_name:
-            st.error("الرجاء كتابة اسم الفيلم أولاً.")
-            st.stop()
+                # بيانات للرسم البياني
+                names = [r.info.arabic_title for r in movies_reports]
+                scores = [r.recommendation.score for r in movies_reports]
+                
+                # رسم بياني أعمدة
+                fig = px.bar(x=names, y=scores, title="تقييمات الأفلام", labels={'x':'الفيلم', 'y':'التقييم'}, range_y=[0,10])
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # جدول تفصيلي
+                comparison_data = {
+                    'العنصر': ['القصة', 'الأداء التمثيلي', 'الإخراج', 'الموسيقى', 'الرمزية']
+                }
+                for report in movies_reports:
+                    comparison_data[report.info.arabic_title] = [
+                        report.analysis.screenplay[:150] + '...',
+                        report.analysis.acting[:150] + '...',
+                        report.analysis.visuals[:150] + '...',
+                        report.analysis.music[:150] + '...',
+                        report.analysis.symbolism[:150] + '...'
+                    ]
+                
+                df_comp = pd.DataFrame(comparison_data)
+                st.dataframe(df_comp, use_container_width=True)
+                
+                # الحكم النهائي
+                st.success(f"**الفائز الإجمالي:** {comparison.get('overall_winner', '')}")
+                st.info(comparison.get('verdict', ''))
+                
+                # تحليل الفروقات
+                st.subheader("🔍 تحليل الفروقات")
+                diff_text = f"**أفضل قصة:** {comparison.get('better_plot', '')}\n\n"
+                diff_text += f"**أفضل أداء:** {comparison.get('better_acting', '')}\n\n"
+                diff_text += f"**أفضل إخراج:** {comparison.get('better_visuals', '')}\n\n"
+                diff_text += f"**أفضل موسيقى:** {comparison.get('better_music', '')}"
+                st.markdown(diff_text)
         
-        with st.spinner(f"جاري استحضار النقد السينمائي لـ '{movie_name}'..."):
-            report = analyze_movie(st.session_state['cerebras_key'], movie_name)
+        else:
+            # وضع عادي
+            report = analyze_movie(
+                st.session_state['cerebras_key'],
+                movies_list[0],
+                content_type=st.session_state['content_type']
+            )
             
             if report:
-                # تحديث سجل التوصيات
-                update_recommendations(report)
+                progress_bar.progress(0.75, text="معالجة النتائج...")
                 
-                # جلب بيانات TMDB إذا توفر المفتاح
-                tmdb_data = None
-                if 'tmdb_key' in st.session_state:
-                    tmdb_data = fetch_tmdb_data(st.session_state['tmdb_key'], movie_name)
+                # حفظ في قاعدة البيانات
+                save_report_to_db(report)
                 
-                # --- رأس الصفحة مع خلفية إن وجدت ---
-                if tmdb_data and tmdb_data['backdrop']:
-                    st.image(tmdb_data['backdrop'], use_column_width=True)
+                tmdb_data = tmdb_datas[0] if tmdb_datas else None
                 
+                # عرض المقطع الدعائي إن وجد
+                if tmdb_data and tmdb_data.get('trailer_key'):
+                    st.video(f"https://www.youtube.com/watch?v={tmdb_data['trailer_key']}")
+                
+                # --- رأس الصفحة ---
+                st.markdown("---")
                 col_img, col_meta = st.columns([1, 3])
                 
                 with col_img:
-                    if tmdb_data and tmdb_data['poster']:
-                        st.image(tmdb_data['poster'], width=250)
+                    if tmdb_data and tmdb_data.get('poster'):
+                        st.image(tmdb_data['poster'], width=200)
                     else:
-                        st.image("https://via.placeholder.com/250x375?text=No+Poster", width=250)
-                    
-                    if tmdb_data and tmdb_data['videos']:
-                        st.markdown("**🎬 مشاهدة الإعلان:**")
-                        for video in tmdb_data['videos'][:1]:
-                            video_url = f"https://www.youtube.com/watch?v={video['key']}"
-                            st.markdown(f"[{video['name']}]({video_url})")
+                        st.image("https://via.placeholder.com/200x300?text=No+Poster", width=200)
                 
                 with col_meta:
-                    st.markdown(f"# {report.info.arabic_title}")
-                    if tmdb_data and tmdb_data['tagline']:
-                        st.markdown(f"*{tmdb_data['tagline']}*")
+                    # استخدام خلفية إذا وجدت
+                    if tmdb_data and tmdb_data.get('backdrop'):
+                        st.markdown(f"<div style='background-image: url({tmdb_data['backdrop']}); background-size: cover; padding: 20px; border-radius: 10px;'>", unsafe_allow_html=True)
                     
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("العنوان الأصلي", report.info.original_title)
+                    c1.metric("العنوان", report.info.arabic_title)
                     c2.metric("السنة", report.info.year)
                     c3.metric("المخرج", report.info.director)
-                    c4.metric("تقييم CineMate", f"{report.recommendation.score}/10")
-                    
-                    # صف ثاني من المقاييس من TMDB
-                    if tmdb_data:
-                        rc1, rc2, rc3, rc4 = st.columns(4)
-                        rc1.metric("تقييم TMDB", f"{tmdb_data['rating']}/10" if tmdb_data['rating'] else "N/A")
-                        rc2.metric("عدد التقييمات", tmdb_data['votes'] if tmdb_data['votes'] else "N/A")
-                        rc3.metric("المدة", f"{tmdb_data['runtime']} دقيقة" if tmdb_data['runtime'] else "N/A")
-                        rc4.metric("التصنيف", tmdb_data['certification'] if tmdb_data['certification'] else "N/A")
+                    c4.metric("التقييم", f"{report.recommendation.score}/10")
                     
                     st.write("**التصنيف:** " + ", ".join([f"`{g}`" for g in report.info.genre]))
                     
                     if tmdb_data:
-                        if tmdb_data['production_countries']:
-                            st.write("**دول الإنتاج:** " + ", ".join(tmdb_data['production_countries']))
-                        if tmdb_data['budget'] and tmdb_data['revenue']:
-                            st.write(f"**الميزانية:** {format_currency(tmdb_data['budget'])}  |  **الإيرادات:** {format_currency(tmdb_data['revenue'])}")
-                        if tmdb_data['homepage']:
-                            st.markdown(f"**[الموقع الرسمي]({tmdb_data['homepage']})**")
+                        st.write(f"**تقييم TMDB:** {tmdb_data.get('rating', 'N/A')}/10")
+                        if tmdb_data.get('cast'):
+                            st.write("**أبرز الممثلين:** " + ", ".join(tmdb_data['cast']))
+                    
+                    if tmdb_data and tmdb_data.get('backdrop'):
+                        st.markdown("</div>", unsafe_allow_html=True)
                 
-                # --- تبويب خاص ببيانات TMDB ---
-                if tmdb_data:
-                    with st.expander("📽️ بيانات إضافية من TMDB", expanded=False):
-                        if tmdb_data['cast']:
-                            st.subheader("طاقم التمثيل")
-                            cast_cols = st.columns(5)
-                            for i, actor in enumerate(tmdb_data['cast'][:10]):
-                                with cast_cols[i % 5]:
-                                    if actor['profile']:
-                                        st.image(actor['profile'], width=100)
-                                    else:
-                                        st.image("https://via.placeholder.com/100x100?text=No+Image", width=100)
-                                    st.markdown(f"**{actor['name']}**")
-                                    st.caption(actor['character'])
-                        
-                        if tmdb_data['writers']:
-                            st.subheader("كتاب السيناريو")
-                            st.write(", ".join(tmdb_data['writers']))
-                        
-                        if tmdb_data['recommendations']:
-                            st.subheader("🔗 توصيات من TMDB")
-                            rec_cols = st.columns(5)
-                            for i, rec in enumerate(tmdb_data['recommendations'][:5]):
-                                with rec_cols[i]:
-                                    if rec['poster']:
-                                        st.image(rec['poster'], width=120)
-                                    else:
-                                        st.image("https://via.placeholder.com/120x180?text=No+Poster", width=120)
-                                    st.markdown(f"**{rec['title']}** ({rec['year']})")
+                # تحليل شخصية إذا طلب
+                if character_name:
+                    with st.spinner(f"جاري تحليل شخصية {character_name}..."):
+                        # يمكن إضافة طلب منفصل لتحليل الشخصية
+                        st.info("هذه الميزة قيد التطوير، سيتم إضافتها قريباً.")
                 
-                # --- التبويبات الأساسية ---
-                tab1, tab2, tab3, tab4 = st.tabs(["📝 التحليل الفني", "⚖️ الحكم والمميزات", "🧠 العمق والرسائل", "🔗 توصيات ذكية"])
+                # --- التبويبات ---
+                tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 التحليل الفني", "⚖️ الحكم والمميزات", "🧠 العمق والرسائل", "🔗 توصيات ذكية", "📤 مشاركة وتصدير"])
                 
                 with tab1:
                     st.header("التحليل الفني")
@@ -540,10 +698,29 @@ if analyze_btn:
                     st.progress(report.recommendation.score / 10, text="جودة العمل الفني")
                 
                 with tab4:
-                    st.header("توصيات ذكية بناءً على تحليلاتك السابقة")
-                    recommendations = get_smart_recommendations(report)
+                    st.header("توصيات ذكية")
+                    recommendations = get_smart_recommendations(report, tmdb_data)
                     if recommendations:
                         for rec in recommendations:
-                            st.write(f"- **{rec['arabic_title']}** ({rec['director']}) – تقييم: {rec['score']}/10")
+                            if rec['source'] == "TMDB":
+                                st.write(f"- 🎬 **{rec['title']}** (من TMDB)")
+                            else:
+                                st.write(f"- 🎥 **{rec['title']}** ({rec.get('director', '')}) – تقييم: {rec.get('score', 'N/A')}/10")
                     else:
                         st.info("قم بتحليل المزيد من الأفلام للحصول على توصيات مخصصة.")
+                
+                with tab5:
+                    st.header("مشاركة وتصدير")
+                    md_report = generate_markdown_report(report, tmdb_data)
+                    st.download_button("📥 تحميل التقرير (Markdown)", data=md_report, file_name=f"{report.info.original_title}.md", mime="text/markdown")
+                    
+                    # نسخ الرابط (محاكاة)
+                    if st.button("📋 نسخ رابط المشاركة"):
+                        st.info("تم نسخ الرابط (محاكاة)، يمكنك مشاركته مع أصدقائك.")
+                
+                progress_bar.progress(1.0, text="اكتمل!")
+                time.sleep(0.5)
+                progress_bar.empty()
+
+if __name__ == "__main__":
+    main()
