@@ -1,284 +1,222 @@
-"""
-🤖 تطبيق Streamlit لاستخدام GLM API
-جميع النماذج المتاحة من Zhipu AI
-"""
-
 import streamlit as st
-from openai import OpenAI
+import requests
+import json
 import time
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
-# ==================== إعدادات الصفحة ====================
+# ==========================================
+# 1. إعدادات الصفحة والتصميم
+# ==========================================
 st.set_page_config(
-    page_title="GLM Chat - محادثة ذكية",
-    page_icon="🤖",
+    page_title="CineMate Pro - الناقد السينمائي",
+    page_icon="🎬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ==================== النماذج المتاحة ====================
-GLM_MODELS = {
-    "glm-4-plus": {
-        "name": "GLM-4 Plus ⭐",
-        "description": "الأحدث والأقوى - أداء متفوق",
-        "max_tokens": 128000,
-        "recommended": True
-    },
-    "glm-4": {
-        "name": "GLM-4",
-        "description": "نموذج متعدد الاستخدامات",
-        "max_tokens": 128000,
-        "recommended": False
-    },
-    "glm-4-air": {
-        "name": "GLM-4 Air 🚀",
-        "description": "سريع وفعال للمهام اليومية",
-        "max_tokens": 128000,
-        "recommended": False
-    },
-    "glm-4-flash": {
-        "name": "GLM-4 Flash ⚡",
-        "description": "الأسرع - مثالي للردود السريعة",
-        "max_tokens": 128000,
-        "recommended": False
-    },
-    "glm-4-long": {
-        "name": "GLM-4 Long 📚",
-        "description": "للنصوص الطويلة والوثائق",
-        "max_tokens": 1024000,
-        "recommended": False
-    },
-    "glm-3-turbo": {
-        "name": "GLM-3 Turbo",
-        "description": "نموذج الجيل السابق - اقتصادي",
-        "max_tokens": 32000,
-        "recommended": False
+# تخصيص CSS للغة العربية
+st.markdown("""
+<style>
+    .main {direction: rtl; text-align: right;}
+    .stTextInput > div > div > input {text-align: right;}
+    h1, h2, h3, p {font-family: 'Tahoma', sans-serif;}
+    .metric-card {background-color: #f0f2f6; padding: 15px; border-radius: 10px; border: 1px solid #ddd; text-align: center;}
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 2. هيكلية البيانات (The Brain - Pydantic)
+# ==========================================
+class MovieInfo(BaseModel):
+    arabic_title: str = Field(..., description="The movie title in Arabic")
+    original_title: str = Field(..., description="The original title")
+    year: int = Field(..., description="Release year")
+    director: str = Field(..., description="Director name")
+    duration: str = Field(..., description="Duration (e.g., 2h 15m)")
+    genre: List[str] = Field(..., description="List of genres in Arabic")
+
+class TechnicalAnalysis(BaseModel):
+    screenplay: str = Field(..., description="Deep analysis of the plot and writing in Arabic")
+    acting: str = Field(..., description="Analysis of acting performances in Arabic")
+    visuals: str = Field(..., description="Cinematography, lighting, and directing style in Arabic")
+    music: str = Field(..., description="Soundtrack and sound design analysis in Arabic")
+    symbolism: str = Field(..., description="Hidden themes and philosophical messages in Arabic")
+
+class Recommendation(BaseModel):
+    score: float = Field(..., description="Score out of 10")
+    pros: List[str] = Field(..., description="Top 3 pros")
+    cons: List[str] = Field(..., description="Top 3 cons")
+    similar_movies: List[str] = Field(..., description="3 similar movies titles")
+    streaming_on: List[str] = Field(..., description="Where to watch (Netflix, etc.)")
+    final_verdict: str = Field(..., description="A short, professional final verdict in Arabic")
+
+class FullMovieReport(BaseModel):
+    info: MovieInfo
+    analysis: TechnicalAnalysis
+    recommendation: Recommendation
+
+# ==========================================
+# 3. محرك التحليل (Cerebras Engine)
+# ==========================================
+def analyze_movie(api_key: str, movie_name: str) -> Optional[FullMovieReport]:
+    """
+    يتصل بـ Cerebras API ويحلل الفيلم ويعيد كائن Pydantic
+    """
+    API_URL = "https://api.cerebras.ai/v1/chat/completions"
+    MODEL = "llama-3.3-70b"
+
+    # تجهيز مخطط JSON للهيكلية
+    schema_json = json.dumps(FullMovieReport.model_json_schema(), indent=2)
+
+    messages = [
+        {
+            "role": "system",
+            "content": f"""
+            You are an elite Arab Film Critic (like Youssef Chahine mixed with Roger Ebert).
+            Analyze the requested movie/series deeply.
+            Language: High-quality Arabic (Fusha).
+            You MUST output strict JSON following this schema:
+            {schema_json}
+            """
+        },
+        {
+            "role": "user",
+            "content": f"Analyze: {movie_name}"
+        }
+    ]
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.6,
+        "max_tokens": 4000,
+        "response_format": {"type": "json_object"}
     }
-}
 
-# ==================== إعدادات الشريط الجانبي ====================
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    try:
+        response = requests.post(API_URL, headers=headers, json=payload)
+        response.raise_for_status() # التأكد من عدم وجود أخطاء HTTP
+        
+        data = response.json()
+        content = data['choices'][0]['message']['content']
+        
+        # تحويل النص إلى كائن بايثون والتحقق منه
+        parsed_data = json.loads(content)
+        return FullMovieReport(**parsed_data)
+
+    except Exception as e:
+        st.error(f"حدث خطأ أثناء الاتصال: {str(e)}")
+        if 'response' in locals():
+            st.code(response.text) # عرض الخطأ الخام للمساعدة
+        return None
+
+# ==========================================
+# 4. واجهة التطبيق (Frontend Logic)
+# ==========================================
+
+# --- الشريط الجانبي ---
 with st.sidebar:
-    st.title("⚙️ إعدادات")
+    st.image("https://cdn-icons-png.flaticon.com/512/2503/2503508.png", width=100)
+    st.title("إعدادات المحرك")
     
-    # API Key
-    api_key = st.text_input(
-        "🔑 API Key",
-        value="f238665f81e44fad90c96cee0220b018.UnH1zIyvieg0zAnj",
-        type="password",
-        help="أدخل API Key الخاص بك من open.bigmodel.cn"
-    )
+    # إدخال المفتاح (مع حفظه في الجلسة)
+    api_key_input = st.text_input("مفتاح Cerebras API", type="password", help="يبدأ بـ csk-")
+    if api_key_input:
+        st.session_state['api_key'] = api_key_input
     
-    st.divider()
-    
-    # اختيار النموذج
-    st.subheader("🧠 اختيار النموذج")
-    
-    # ترتيب النماذج (الموصى بها أولاً)
-    sorted_models = sorted(GLM_MODELS.items(), key=lambda x: not x[1]["recommended"])
-    
-    model_options = [f"{v['name']}" for k, v in sorted_models]
-    model_keys = [k for k, v in sorted_models]
-    
-    selected_model_index = st.selectbox(
-        "اختر النموذج:",
-        range(len(model_options)),
-        format_func=lambda i: model_options[i]
-    )
-    selected_model = model_keys[selected_model_index]
-    model_info = GLM_MODELS[selected_model]
-    
-    st.caption(f"📝 {model_info['description']}")
-    st.caption(f"📊 الحد الأقصى: {model_info['max_tokens']:,} tokens")
-    
-    st.divider()
-    
-    # إعدادات متقدمة
-    st.subheader("🎛️ إعدادات متقدمة")
-    
-    with st.expander("🔧 تخصيص المعاملات", expanded=False):
-        temperature = st.slider(
-            "🌡️ Temperature",
-            min_value=0.0,
-            max_value=2.0,
-            value=0.7,
-            step=0.1,
-            help="قيم أعلى = إجابات أكثر إبداعاً"
-        )
-        
-        top_p = st.slider(
-            "🎯 Top P",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.9,
-            step=0.05,
-            help="تنويع الإجابات"
-        )
-        
-        max_tokens = st.slider(
-            "📏 Max Tokens",
-            min_value=100,
-            max_value=min(4096, model_info["max_tokens"]),
-            value=2048,
-            step=100,
-            help="الحد الأقصى لطول الرد"
-        )
-        
-        stream_response = st.checkbox(
-            "🌊 Stream Mode",
-            value=True,
-            help="عرض الرد تدريجياً"
-        )
-    
-    st.divider()
-    
-    # System Prompt
-    st.subheader("💬 System Prompt")
-    system_prompt = st.text_area(
-        "تعليمات النظام:",
-        value="أنت مساعد ذكي ومفيد. أجب باللغة العربية إلا إذا طُلب منك غير ذلك.",
-        height=100
-    )
-    
-    st.divider()
-    
-    # أزرار التحكم
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🗑️ مسح المحادثة", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
-    with col2:
-        if st.button("🔄 إعادة تعيين", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-    
-    # معلومات
-    st.divider()
-    st.markdown("""
-    ### 📖 معلومات
-    
-    **GLM** هي نماذج ذكاء اصطناعي من **Zhipu AI**
-    
-    🔗 [open.bigmodel.cn](https://open.bigmodel.cn)
-    
-    ---
-    *تم التطوير بواسطة GLM API*
-    """)
+    st.info("💡 هذا المشروع يستخدم Llama-3.3-70b عبر Cerebras لسرعة فائقة.")
+    st.markdown("---")
+    st.write("Designed by: **AI Architect**")
 
-# ==================== الوظائف المساعدة ====================
+# --- الواجهة الرئيسية ---
+st.title("🎬 CineMate Pro")
+st.subheader("منصة التحليل السينمائي المتقدمة")
 
-def get_client(api_key: str) -> OpenAI:
-    """إنشاء عميل OpenAI متوافق مع GLM"""
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://open.bigmodel.cn/api/paas/v4/"
-    )
+# التحقق من المفتاح
+if 'api_key' not in st.session_state:
+    st.warning("⚠️ يرجى إدخال مفتاح API في القائمة الجانبية للبدء.")
+    st.stop()
 
-def stream_chat(client: OpenAI, messages: list, model: str, **kwargs):
-    """بث الرد تدريجياً"""
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=kwargs.get("temperature", 0.7),
-        top_p=kwargs.get("top_p", 0.9),
-        max_tokens=kwargs.get("max_tokens", 2048),
-        stream=True
-    )
-    return response
-
-def normal_chat(client: OpenAI, messages: list, model: str, **kwargs):
-    """الحصول على الرد كاملاً"""
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=kwargs.get("temperature", 0.7),
-        top_p=kwargs.get("top_p", 0.9),
-        max_tokens=kwargs.get("max_tokens", 2048),
-        stream=False
-    )
-    return response
-
-# ==================== تهيئة المحادثة ====================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# ==================== واجهة المحادثة ====================
-st.title("🤖 GLM Chat - محادثة ذكية")
-st.caption(f"النموذج الحالي: **{model_info['name']}** | {model_info['description']}")
-
-# عرض الرسائل السابقة
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# حقل الإدخال
-if prompt := st.chat_input("اكتب رسالتك هنا..."):
-    # التحقق من API Key
-    if not api_key:
-        st.error("❌ الرجاء إدخال API Key")
-    else:
-        # إضافة رسالة المستخدم
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # إعداد الرسائل للإرسال
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(st.session_state.messages)
-        
-        # الحصول على الرد
-        with st.chat_message("assistant"):
-            try:
-                client = get_client(api_key)
-                
-                if stream_response:
-                    # وضع البث
-                    message_placeholder = st.empty()
-                    full_response = ""
-                    
-                    response = stream_chat(
-                        client, messages, selected_model,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens
-                    )
-                    
-                    for chunk in response:
-                        if chunk.choices[0].delta.content:
-                            full_response += chunk.choices[0].delta.content
-                            message_placeholder.markdown(full_response + "▌")
-                    
-                    message_placeholder.markdown(full_response)
-                else:
-                    # الوضع العادي
-                    with st.spinner("جاري التفكير..."):
-                        response = normal_chat(
-                            client, messages, selected_model,
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens
-                        )
-                    
-                    full_response = response.choices[0].message.content
-                    st.markdown(full_response)
-                
-                # إضافة الرد للمحادثة
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                
-            except Exception as e:
-                st.error(f"❌ حدث خطأ: {str(e)}")
-                if "401" in str(e):
-                    st.warning("⚠️ تحقق من صحة API Key")
-                elif "429" in str(e):
-                    st.warning("⚠️ تم تجاوز حد الطلبات، الرجاء المحاولة لاحقاً")
-
-# ==================== تذييل ====================
-st.divider()
-col1, col2, col3 = st.columns(3)
+# مربع البحث
+col1, col2 = st.columns([3, 1])
 with col1:
-    st.caption(f"📊 عدد الرسائل: {len([m for m in st.session_state.messages if m['role'] == 'user'])}")
+    movie_name = st.text_input("اسم الفيلم أو المسلسل:", placeholder="مثال: The Godfather, Interstellar...")
 with col2:
-    st.caption(f"🧠 النموذج: {selected_model}")
-with col3:
-    st.caption("💎 Powered by GLM API")
+    st.write("") # مسافة
+    st.write("") 
+    analyze_btn = st.button("🔍 تحليل شامل", use_container_width=True)
+
+# منطق العرض
+if analyze_btn and movie_name:
+    with st.spinner(f"جاري استحضار النقد السينمائي لـ '{movie_name}'..."):
+        report = analyze_movie(st.session_state['api_key'], movie_name)
+        
+        if report:
+            # --- رأس الصفحة (Info Header) ---
+            st.markdown("---")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("العنوان", report.info.arabic_title)
+            c2.metric("السنة", report.info.year)
+            c3.metric("المخرج", report.info.director)
+            c4.metric("التقييم", f"{report.recommendation.score}/10")
+            
+            # --- التصنيفات (Tags) ---
+            st.write("**التصنيف:** " + ", ".join([f"`{g}`" for g in report.info.genre]))
+            
+            # --- المحتوى الرئيسي (Tabs) ---
+            tab1, tab2, tab3 = st.tabs(["📝 التحليل الفني", "⚖️ الحكم والمميزات", "🧠 العمق والرسائل"])
+            
+            with tab1:
+                st.header("التحليل الفني")
+                
+                st.subheader("📖 السيناريو والحبكة")
+                st.write(report.analysis.screenplay)
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.subheader("🎭 الأداء التمثيلي")
+                    st.info(report.analysis.acting)
+                with col_b:
+                    st.subheader("🎥 الإخراج والبصريات")
+                    st.success(report.analysis.visuals)
+                
+                st.subheader("🎼 الموسيقى والصوت")
+                st.write(report.analysis.music)
+
+            with tab2:
+                st.header("الحكم النهائي")
+                
+                c_pros, c_cons = st.columns(2)
+                with c_pros:
+                    st.success("✅ **نقاط القوة:**")
+                    for p in report.recommendation.pros:
+                        st.write(f"- {p}")
+                
+                with c_cons:
+                    st.error("❌ **نقاط الضعف:**")
+                    for c in report.recommendation.cons:
+                        st.write(f"- {c}")
+                
+                st.markdown("---")
+                st.subheader("💡 الحكم:")
+                st.warning(f"**{report.recommendation.final_verdict}**")
+                
+                st.write("**📺 متوفر على:** " + ", ".join(report.recommendation.streaming_on))
+                st.write("**🤔 أفلام مشابهة:** " + ", ".join(report.recommendation.similar_movies))
+
+            with tab3:
+                st.header("ما وراء الصورة")
+                st.markdown(f"> {report.analysis.symbolism}")
+                
+                # تصور بياني بسيط (Dummy Visual)
+                st.progress(report.recommendation.score / 10, text="جودة العمل الفني")
+
+else:
+    if not movie_name and analyze_btn:
+        st.error("الرجاء كتابة اسم الفيلم أولاً.")
