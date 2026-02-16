@@ -250,7 +250,7 @@ def call_gemini_with_retry(api_key, prompt, max_retries=3, delay=2):
     
     # اختيار النموذج المناسب (يمكن تغييره إلى pro إذا أردت)
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
+        model_name="gemini-2.5-flash",
         generation_config={
             "temperature": 0.6,
             "top_p": 0.95,
