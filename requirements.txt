@@ -11,4 +11,5 @@ requests
 pydantic
 plotly
 pandas
+google-generativeai
 
