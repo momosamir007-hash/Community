@@ -25,6 +25,8 @@ st.markdown("""
     .metric-card {background-color: #f0f2f6; padding: 15px; border-radius: 10px; border: 1px solid #ddd; text-align: center;}
     .tmdb-card {background-color: #0e1a2b; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px;}
     .comparison-table {background-color: #f9f9f9; border-radius: 10px; padding: 10px;}
+    .cast-card {display: inline-block; text-align: center; margin: 5px; width: 100px;}
+    .cast-card img {border-radius: 50%; width: 80px; height: 80px; object-fit: cover;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -60,46 +62,132 @@ class FullMovieReport(BaseModel):
     recommendation: Recommendation
 
 # ==========================================
-# 3. دوال مساعدة (TMDB Integration)
+# 3. دوال مساعدة (TMDB Integration متقدم)
 # ==========================================
 def fetch_tmdb_data(api_key: str, movie_name: str):
-    """جلب بيانات إضافية من TMDB"""
+    """جلب بيانات غنية من TMDB: تفاصيل، طاقم، صور، توصيات، فيديوهات"""
     if not api_key:
         return None
     try:
-        # البحث عن الفيلم
+        # بحث متعدد اللغات (إنجليزي + عربي)
         search_url = "https://api.themoviedb.org/3/search/movie"
         params = {
             "api_key": api_key,
             "query": movie_name,
-            "language": "ar-SA"  # نفضل العربية إن وجدت
+            "language": "ar-SA",  # نحاول العربية أولاً
+            "include_adult": False
         }
         response = requests.get(search_url, params=params)
         response.raise_for_status()
         data = response.json()
-        if data['results']:
-            movie = data['results'][0]
-            movie_id = movie['id']
-            
-            # جلب تفاصيل إضافية (الممثلين)
-            credits_url = f"https://api.themoviedb.org/3/movie/{movie_id}/credits"
-            credits_response = requests.get(credits_url, params={"api_key": api_key})
-            credits_response.raise_for_status()
-            credits = credits_response.json()
-            
-            # استخراج أبرز 5 ممثلين
-            cast = [actor['name'] for actor in credits.get('cast', [])[:5]]
-            
-            return {
-                'poster': f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie.get('poster_path') else None,
-                'rating': movie.get('vote_average'),
-                'overview': movie.get('overview'),
-                'cast': cast,
-                'director': next((crew['name'] for crew in credits.get('crew', []) if crew['job'] == 'Director'), None)
-            }
+        
+        if not data['results']:
+            # جرب بالإنجليزية إذا لم تكن هناك نتائج عربية
+            params["language"] = "en-US"
+            response = requests.get(search_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            if not data['results']:
+                return None
+        
+        movie = data['results'][0]
+        movie_id = movie['id']
+        
+        # جلب التفاصيل الكاملة
+        details_url = f"https://api.themoviedb.org/3/movie/{movie_id}"
+        details_params = {
+            "api_key": api_key,
+            "language": "ar-SA",
+            "append_to_response": "credits,videos,recommendations,release_dates"
+        }
+        details_response = requests.get(details_url, params=details_params)
+        details_response.raise_for_status()
+        details = details_response.json()
+        
+        # معالجة البيانات
+        poster = f"https://image.tmdb.org/t/p/w500{details['poster_path']}" if details.get('poster_path') else None
+        backdrop = f"https://image.tmdb.org/t/p/original{details['backdrop_path']}" if details.get('backdrop_path') else None
+        
+        # طاقم التمثيل (أول 10 مع صور)
+        cast = []
+        for actor in details.get('credits', {}).get('cast', [])[:10]:
+            cast.append({
+                'name': actor['name'],
+                'character': actor['character'],
+                'profile': f"https://image.tmdb.org/t/p/w185{actor['profile_path']}" if actor.get('profile_path') else None,
+                'order': actor['order']
+            })
+        
+        # المخرج والكتاب
+        director = None
+        writers = []
+        for crew in details.get('credits', {}).get('crew', []):
+            if crew['job'] == 'Director':
+                director = crew['name']
+            elif crew['job'] in ['Writer', 'Screenplay', 'Author']:
+                writers.append(crew['name'])
+        
+        # فيديوهات (trailer)
+        videos = []
+        for video in details.get('videos', {}).get('results', []):
+            if video['type'] == 'Trailer' and video['site'] == 'YouTube':
+                videos.append({
+                    'key': video['key'],
+                    'name': video['name']
+                })
+        
+        # توصيات من TMDB
+        recommendations = []
+        for rec in details.get('recommendations', {}).get('results', [])[:5]:
+            recommendations.append({
+                'title': rec['title'],
+                'poster': f"https://image.tmdb.org/t/p/w200{rec['poster_path']}" if rec.get('poster_path') else None,
+                'year': rec.get('release_date', '')[:4] if rec.get('release_date') else None,
+                'id': rec['id']
+            })
+        
+        # تصنيف المحتوى (PG-13, R, إلخ) حسب البلد
+        certification = None
+        for release in details.get('release_dates', {}).get('results', []):
+            if release['iso_3166_1'] == 'US':  # نأخذ التصنيف الأمريكي كمرجع
+                for rel in release['release_dates']:
+                    if rel.get('certification'):
+                        certification = rel['certification']
+                        break
+                if certification:
+                    break
+        
+        return {
+            'id': movie_id,
+            'poster': poster,
+            'backdrop': backdrop,
+            'rating': details.get('vote_average'),
+            'votes': details.get('vote_count'),
+            'overview': details.get('overview'),
+            'tagline': details.get('tagline'),
+            'budget': details.get('budget'),
+            'revenue': details.get('revenue'),
+            'runtime': details.get('runtime'),
+            'original_language': details.get('original_language'),
+            'production_countries': [c['name'] for c in details.get('production_countries', [])],
+            'genres': [g['name'] for g in details.get('genres', [])],
+            'cast': cast,
+            'director': director,
+            'writers': writers,
+            'videos': videos,
+            'recommendations': recommendations,
+            'certification': certification,
+            'homepage': details.get('homepage')
+        }
     except Exception as e:
         st.warning(f"تعذر جلب بيانات TMDB: {e}")
-    return None
+        return None
+
+def format_currency(amount):
+    """تنسيق الأرقام كعملة (دولار)"""
+    if not amount or amount == 0:
+        return "غير متوفر"
+    return f"${amount:,.0f}"
 
 # ==========================================
 # 4. محرك التحليل (Cerebras)
@@ -223,7 +311,7 @@ with st.sidebar:
         st.session_state['cerebras_key'] = cerebras_key
     
     # مفتاح TMDB (اختياري)
-    tmdb_key = st.text_input("مفتاح TMDB API (اختياري)", type="password", help="لجلب بيانات إضافية")
+    tmdb_key = st.text_input("مفتاح TMDB API (اختياري)", type="password", help="لجلب بيانات إضافية غنية")
     if tmdb_key:
         st.session_state['tmdb_key'] = tmdb_key
     
@@ -331,31 +419,84 @@ if analyze_btn:
                 if 'tmdb_key' in st.session_state:
                     tmdb_data = fetch_tmdb_data(st.session_state['tmdb_key'], movie_name)
                 
-                # --- رأس الصفحة ---
-                st.markdown("---")
+                # --- رأس الصفحة مع خلفية إن وجدت ---
+                if tmdb_data and tmdb_data['backdrop']:
+                    st.image(tmdb_data['backdrop'], use_column_width=True)
+                
                 col_img, col_meta = st.columns([1, 3])
                 
                 with col_img:
                     if tmdb_data and tmdb_data['poster']:
-                        st.image(tmdb_data['poster'], width=200)
+                        st.image(tmdb_data['poster'], width=250)
                     else:
-                        st.image("https://via.placeholder.com/200x300?text=No+Poster", width=200)
+                        st.image("https://via.placeholder.com/250x375?text=No+Poster", width=250)
+                    
+                    if tmdb_data and tmdb_data['videos']:
+                        st.markdown("**🎬 مشاهدة الإعلان:**")
+                        for video in tmdb_data['videos'][:1]:
+                            video_url = f"https://www.youtube.com/watch?v={video['key']}"
+                            st.markdown(f"[{video['name']}]({video_url})")
                 
                 with col_meta:
+                    st.markdown(f"# {report.info.arabic_title}")
+                    if tmdb_data and tmdb_data['tagline']:
+                        st.markdown(f"*{tmdb_data['tagline']}*")
+                    
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("العنوان", report.info.arabic_title)
+                    c1.metric("العنوان الأصلي", report.info.original_title)
                     c2.metric("السنة", report.info.year)
                     c3.metric("المخرج", report.info.director)
-                    c4.metric("التقييم", f"{report.recommendation.score}/10")
+                    c4.metric("تقييم CineMate", f"{report.recommendation.score}/10")
+                    
+                    # صف ثاني من المقاييس من TMDB
+                    if tmdb_data:
+                        rc1, rc2, rc3, rc4 = st.columns(4)
+                        rc1.metric("تقييم TMDB", f"{tmdb_data['rating']}/10" if tmdb_data['rating'] else "N/A")
+                        rc2.metric("عدد التقييمات", tmdb_data['votes'] if tmdb_data['votes'] else "N/A")
+                        rc3.metric("المدة", f"{tmdb_data['runtime']} دقيقة" if tmdb_data['runtime'] else "N/A")
+                        rc4.metric("التصنيف", tmdb_data['certification'] if tmdb_data['certification'] else "N/A")
                     
                     st.write("**التصنيف:** " + ", ".join([f"`{g}`" for g in report.info.genre]))
                     
                     if tmdb_data:
-                        st.write(f"**تقييم TMDB:** {tmdb_data['rating']}/10")
-                        if tmdb_data['cast']:
-                            st.write("**أبرز الممثلين:** " + ", ".join(tmdb_data['cast']))
+                        if tmdb_data['production_countries']:
+                            st.write("**دول الإنتاج:** " + ", ".join(tmdb_data['production_countries']))
+                        if tmdb_data['budget'] and tmdb_data['revenue']:
+                            st.write(f"**الميزانية:** {format_currency(tmdb_data['budget'])}  |  **الإيرادات:** {format_currency(tmdb_data['revenue'])}")
+                        if tmdb_data['homepage']:
+                            st.markdown(f"**[الموقع الرسمي]({tmdb_data['homepage']})**")
                 
-                # --- التبويبات ---
+                # --- تبويب خاص ببيانات TMDB ---
+                if tmdb_data:
+                    with st.expander("📽️ بيانات إضافية من TMDB", expanded=False):
+                        if tmdb_data['cast']:
+                            st.subheader("طاقم التمثيل")
+                            cast_cols = st.columns(5)
+                            for i, actor in enumerate(tmdb_data['cast'][:10]):
+                                with cast_cols[i % 5]:
+                                    if actor['profile']:
+                                        st.image(actor['profile'], width=100)
+                                    else:
+                                        st.image("https://via.placeholder.com/100x100?text=No+Image", width=100)
+                                    st.markdown(f"**{actor['name']}**")
+                                    st.caption(actor['character'])
+                        
+                        if tmdb_data['writers']:
+                            st.subheader("كتاب السيناريو")
+                            st.write(", ".join(tmdb_data['writers']))
+                        
+                        if tmdb_data['recommendations']:
+                            st.subheader("🔗 توصيات من TMDB")
+                            rec_cols = st.columns(5)
+                            for i, rec in enumerate(tmdb_data['recommendations'][:5]):
+                                with rec_cols[i]:
+                                    if rec['poster']:
+                                        st.image(rec['poster'], width=120)
+                                    else:
+                                        st.image("https://via.placeholder.com/120x180?text=No+Poster", width=120)
+                                    st.markdown(f"**{rec['title']}** ({rec['year']})")
+                
+                # --- التبويبات الأساسية ---
                 tab1, tab2, tab3, tab4 = st.tabs(["📝 التحليل الفني", "⚖️ الحكم والمميزات", "🧠 العمق والرسائل", "🔗 توصيات ذكية"])
                 
                 with tab1:
