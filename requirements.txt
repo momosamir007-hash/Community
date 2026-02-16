@@ -7,4 +7,8 @@ sentencepiece
 watchdog
 cerebras_cloud_sdk
 openpyxl
+requests
+pydantic
+plotly
+pandas
 
