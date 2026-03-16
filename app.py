@@ -4,11 +4,22 @@ import numpy as np
 import requests
 import base64
 import pandas as pd
+import fitz  # مكتبة PyMuPDF للتعامل مع ملفات PDF
 
 # ==========================================
-# إعدادات الـ API (Cloud OCR)
+# إعدادات الصفحة (يجب أن يكون أول أمر Streamlit)
 # ==========================================
-API_KEY = st.secrets["OCR_API_KEY"]
+st.set_page_config(page_title="Sudoku AR Solver", page_icon="🧩", layout="centered")
+
+# ==========================================
+# إعدادات الـ API (Cloud OCR) - باستخدام Secrets
+# ==========================================
+try:
+    API_KEY = st.secrets["OCR_API_KEY"]
+except KeyError:
+    st.error("⚠️ لم يتم العثور على مفتاح API. الرجاء إعداد secrets.toml أو إضافته في إعدادات Streamlit Cloud.")
+    st.stop()
+
 OCR_URL = 'https://api.ocr.space/parse/image'
 
 # ==========================================
@@ -73,7 +84,7 @@ def extract_digits_via_api(warped_img):
     }
 
     try:
-        response = requests.post(OCR_URL, data=payload, timeout=15)
+        response = requests.post(OCR_URL, data=payload, timeout=20)
         result = response.json()
         if result.get('IsErroredOnProcessing'):
             st.error(f"خطأ من الخادم: {result.get('ErrorMessage')}")
@@ -126,38 +137,63 @@ def solve_sudoku(board):
     return True
 
 # ==========================================
-# 4. الواقع المعزز (AR)
+# 4. الواقع المعزز (AR Overlay)
 # ==========================================
 def display_numbers(img, solved_board, original_board):
     cell_w = img.shape[1] // 9
     cell_h = img.shape[0] // 9
     for i in range(9):
         for j in range(9):
-            # نرسم الرقم فقط إذا كانت الخلية الأصلية فارغة وتم حلها
+            # نرسم الرقم فقط في الخلايا التي كانت فارغة وتم حلها
             if original_board[i][j] == 0 and solved_board[i][j] != 0:
                 text = str(solved_board[i][j])
                 text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
                 text_x = (j * cell_w) + (cell_w - text_size[0]) // 2
                 text_y = (i * cell_h) + (cell_h + text_size[1]) // 2
+                # كتابة الرقم باللون الأخضر
                 cv2.putText(img, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     return img
 
 # ==========================================
 # واجهة Streamlit التفاعلية
 # ==========================================
-st.set_page_config(page_title="Sudoku AR Solver", page_icon="🧩", layout="centered")
+st.title("🧩 حلّال السودوكو الذكي بالواقع المعزز")
+st.write("التقط صورة لشبكة السودوكو، أو قم برفع ملف (صورة/PDF)، وسيقوم التطبيق بتحليلها وحلها.")
 
-st.title("🧩 حلّال السودوكو بالواقع المعزز")
-st.write("التقط صورة لشبكة السودوكو، راجع الأرقام، وسيقوم التطبيق بحلها.")
+# خيارات إدخال اللغز
+input_method = st.radio("اختر طريقة إدخال اللغز:", ("📸 استخدام الكاميرا", "📁 رفع ملف (صورة أو PDF)"))
 
-camera_image = st.camera_input("وجه الكاميرا نحو السودوكو والتقط صورة")
+cv2_img = None
 
-if camera_image is not None:
-    bytes_data = camera_image.getvalue()
-    cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
+# 1. حالة الكاميرا
+if input_method == "📸 استخدام الكاميرا":
+    camera_image = st.camera_input("وجه الكاميرا نحو السودوكو والتقط صورة")
+    if camera_image is not None:
+        bytes_data = camera_image.getvalue()
+        cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
+
+# 2. حالة رفع الملف
+elif input_method == "📁 رفع ملف (صورة أو PDF)":
+    uploaded_file = st.file_uploader("قم بسحب وإفلات الملف هنا", type=['png', 'jpg', 'jpeg', 'pdf'])
     
-    # استخدام Hash للصورة لمعرفة ما إذا قام المستخدم بالتقاط صورة جديدة
-    img_hash = hash(bytes_data)
+    if uploaded_file is not None:
+        if uploaded_file.name.lower().endswith('.pdf'):
+            with st.spinner("جاري استخراج الصفحة من الـ PDF..."):
+                doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                page = doc.load_page(0)
+                pix = page.get_pixmap(dpi=150)
+                img_data = pix.tobytes("png")
+                cv2_img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+        else:
+            bytes_data = uploaded_file.read()
+            cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
+
+# ==========================================
+# معالجة الصورة وعرض النتائج
+# ==========================================
+if cv2_img is not None:
+    # استخدام Hash لضمان عدم إعادة المعالجة لنفس الصورة عند كل ضغطة زر
+    img_hash = hash(cv2_img.tobytes())
     if 'current_img_hash' not in st.session_state or st.session_state.current_img_hash != img_hash:
         st.session_state.current_img_hash = img_hash
         st.session_state.board_extracted = False
@@ -169,9 +205,14 @@ if camera_image is not None:
     if contour is not None:
         width, height = 450, 450
         warped, matrix = warp_image(cv2_img, contour, width, height)
-        st.image(warped, channels="BGR", caption="الشبكة المستخرجة (للمقارنة)", use_container_width=True)
         
-        # استخراج الأرقام مرة واحدة فقط لكل صورة جديدة
+        # تقسيم الشاشة لعرض الصورة المستخرجة والجدول التفاعلي بجانب بعضهما (في الشاشات الكبيرة)
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.image(warped, channels="BGR", caption="الشبكة المستخرجة (تم تصحيح المنظور)", use_container_width=True)
+        
+        # استخراج الأرقام عبر الـ API مرة واحدة فقط
         if not st.session_state.board_extracted:
             with st.spinner("⏳ جاري قراءة الأرقام عبر الـ API..."):
                 board = extract_digits_via_api(warped)
@@ -179,41 +220,36 @@ if camera_image is not None:
                     st.session_state.original_board = board
                     st.session_state.board_extracted = True
         
-        # إذا تم استخراج الأرقام بنجاح، نعرض جدول المراجعة
-        if st.session_state.board_extracted and st.session_state.original_board is not None:
-            st.markdown("### 📝 مراجعة وتصحيح الأرقام")
-            st.info("الرقم (0) يمثل الخلية الفارغة. اضغط مرتين على أي خلية لتعديلها إذا أخطأ الخادم في قراءتها.")
-            
-            # تحويل المصفوفة إلى DataFrame لسهولة التعديل في الواجهة
-            df = pd.DataFrame(st.session_state.original_board, columns=[str(i) for i in range(1, 10)])
-            
-            # عرض الجدول التفاعلي القابل للتعديل
-            edited_df = st.data_editor(df, hide_index=True, use_container_width=True)
-            
-            if st.button("🚀 تأكيد وحل اللغز", type="primary"):
-                # تحويل الجدول المعدل إلى مصفوفة Numpy مجدداً
-                corrected_board = edited_df.to_numpy()
-                solved_board = corrected_board.copy()
+        with col2:
+            if st.session_state.board_extracted and st.session_state.original_board is not None:
+                st.markdown("### 📝 مراجعة الأرقام")
+                st.info("الرقم (0) = خلية فارغة. اضغط على أي خلية لتعديلها إذا قرأها السيرفر بشكل خاطئ.")
                 
-                with st.spinner("🧠 جاري تشغيل خوارزمية الحل..."):
-                    if solve_sudoku(solved_board):
-                        st.success("✅ تم إيجاد الحل بنجاح!")
-                        
-                        # دمج الحل مع الصورة الأصلية (الواقع المعزز)
-                        ar_layer = np.zeros((height, width, 3), dtype=np.uint8)
-                        # نرسل corrected_board لكي لا يكتب التطبيق الأرقام فوق الأرقام التي صححتها أنت
-                        ar_layer = display_numbers(ar_layer, solved_board, corrected_board)
-                        
-                        inverse_matrix = cv2.getPerspectiveTransform(
-                            np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]), 
-                            order_points(contour)
-                        )
-                        inv_warp = cv2.warpPerspective(ar_layer, inverse_matrix, (cv2_img.shape[1], cv2_img.shape[0]))
-                        final_result = cv2.addWeighted(cv2_img, 1, inv_warp, 1, 0)
-                        
-                        st.image(final_result, channels="BGR", caption="النتيجة النهائية (الواقع المعزز)", use_container_width=True)
-                        st.balloons() # تأثير احتفالي عند نجاح الحل!
-                    else:
-                        st.error("⚠️ الأرقام الموجودة في الجدول غير قابلة للحل. يرجى التأكد من عدم وجود أرقام مكررة في نفس الصف أو العمود.")
+                df = pd.DataFrame(st.session_state.original_board, columns=[str(i) for i in range(1, 10)])
+                edited_df = st.data_editor(df, hide_index=True, use_container_width=True)
+                
+                if st.button("🚀 تأكيد وحل اللغز", type="primary", use_container_width=True):
+                    corrected_board = edited_df.to_numpy()
+                    solved_board = corrected_board.copy()
+                    
+                    with st.spinner("🧠 جاري الحل..."):
+                        if solve_sudoku(solved_board):
+                            st.success("✅ تم إيجاد الحل!")
+                            
+                            # تركيب الحل فوق الصورة الأصلية (الواقع المعزز)
+                            ar_layer = np.zeros((height, width, 3), dtype=np.uint8)
+                            ar_layer = display_numbers(ar_layer, solved_board, corrected_board)
+                            
+                            inverse_matrix = cv2.getPerspectiveTransform(
+                                np.float32([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]]), 
+                                order_points(contour)
+                            )
+                            inv_warp = cv2.warpPerspective(ar_layer, inverse_matrix, (cv2_img.shape[1], cv2_img.shape[0]))
+                            final_result = cv2.addWeighted(cv2_img, 1, inv_warp, 1, 0)
+                            
+                            st.image(final_result, channels="BGR", caption="النتيجة النهائية", use_container_width=True)
+                            st.balloons()
+                        else:
+                            st.error("⚠️ هذه الشبكة غير قابلة للحل. تأكد من عدم تكرار الأرقام بشكل خاطئ.")
     else:
-        st.error("❌ لم يتم العثور على شبكة سودوكو واضحة. يرجى التأكد من الإضاءة وإظهار حواف المربع بالكامل.")
+        st.error("❌ لم يتم العثور على شبكة سودوكو واضحة. يرجى التأكد من أن الصورة تحتوي على مربع واضح المعالم.")
