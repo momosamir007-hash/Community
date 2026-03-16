@@ -1,15 +1,5 @@
-openai
 streamlit
-python-docx
-transformers
-torch
-sentencepiece
-watchdog
-cerebras_cloud_sdk
-openpyxl
+opencv-python-headless
+numpy
 requests
-pydantic
-plotly
 pandas
-google-generativeai
-
