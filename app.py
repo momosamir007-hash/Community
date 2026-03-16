@@ -43,11 +43,16 @@ for key, default in {
         st.session_state[key] = default
 
 # ==========================================
-# 1. دوال معالجة الصور
+# 1. دوال معالجة الصور (بتقنيات الفلترة الجديدة)
 # ==========================================
 def preprocess_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 1)
+    
+    # 🌟 إضافة فلتر التوضيح (Sharpening Filter) الذي اقترحته
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    
+    blur = cv2.GaussianBlur(sharpened, (5, 5), 1)
     thresh = cv2.adaptiveThreshold(
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
     )
@@ -86,128 +91,95 @@ def warp_image(img, pts, size=450):
     return warped, M
 
 # ==========================================
-# 2. كشف الخلايا الممتلئة (احتياطي فقط)
+# 2. الاستخراج الدقيق للرقم (Digit Isolation) 🌟 التحديث الأهم 🌟
 # ==========================================
 def get_cell_inner(gray, row, col, grid_size=450, margin=0.15):
     cell_size = grid_size // 9
     y1 = row * cell_size
     x1 = col * cell_size
     cell = gray[y1:y1 + cell_size, x1:x1 + cell_size]
+    # قص هوامش المربع بقوة للتخلص من خطوط الشبكة نهائياً
     m = int(cell_size * margin)
     inner = cell[m:cell_size - m, m:cell_size - m]
     return inner
 
-def is_cell_filled(cell_gray):
+def extract_clean_digit(cell_gray):
+    """
+    هذه الدالة تقوم بعزل الرقم فقط ووضعه في لوحة بيضاء لتسهيل قراءته على الـ OCR
+    """
     _, thresh = cv2.threshold(cell_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    total = thresh.shape[0] * thresh.shape[1]
-    if total == 0: return False
-    white = cv2.countNonZero(thresh)
-    ratio = white / total
-    if ratio < 0.01 or ratio > 0.95: # تم توسيع النطاق لعدم تفويت أرقام خفيفة
-        return False
-    return True
+    
+    # البحث عن الكتل (Contours) داخل الخلية
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+        
+    # افتراض أن أكبر كتلة في الخلية هي الرقم
+    largest_contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest_contour) < 20: # إذا كانت الكتلة صغيرة جداً فهي مجرد غبار/تشويش
+        return None
+        
+    # الحصول على إحداثيات الرقم
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    
+    # استبعاد الكتل التي لا تشبه الأرقام (مثل خطوط طويلة جداً أو عريضة جداً)
+    aspect_ratio = h / float(w)
+    if aspect_ratio < 0.2 or aspect_ratio > 5.0:
+        return None
 
-def detect_filled_cells(warped_img):
-    gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
-    mask = np.zeros((9, 9), dtype=bool)
-    for i in range(9):
-        for j in range(9):
-            inner = get_cell_inner(gray, i, j)
-            mask[i][j] = is_cell_filled(inner)
-    return mask
+    # قص الرقم فقط
+    digit_roi = thresh[y:y+h, x:x+w]
+    digit_roi = cv2.bitwise_not(digit_roi) # جعل الرقم أسود والخلفية بيضاء
+    
+    # إنشاء لوحة بيضاء بمقاس 100x100 (المقاس المفضل للـ OCR)
+    canvas = np.ones((100, 100), dtype=np.uint8) * 255
+    
+    # تكبير الرقم ليملأ جزءاً جيداً من اللوحة
+    scale = 60.0 / max(w, h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized_digit = cv2.resize(digit_roi, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # وضع الرقم في منتصف اللوحة
+    start_x = (100 - new_w) // 2
+    start_y = (100 - new_h) // 2
+    canvas[start_y:start_y+new_h, start_x:start_x+new_w] = resized_digit
+    
+    return canvas
 
 # ==========================================
-# 3. إزالة خطوط الشبكة 
+# 3. استخراج الأرقام عبر OCR (خلية بخلية لضمان الدقة القصوى)
 # ==========================================
-def remove_grid_lines(warped_img):
-    gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    h_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel, iterations=2)
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    v_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel, iterations=2)
-    all_lines = cv2.add(h_lines, v_lines)
-    clean = cv2.subtract(thresh, all_lines)
-    repair_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, repair_kernel)
-    result = cv2.bitwise_not(clean)
-    return result
-
-# ==========================================
-# 4. استخراج الأرقام عبر OCR
-# ==========================================
-def ocr_overlay_method(warped_img):
-    board = np.zeros((9, 9), dtype=int)
-    h, w = warped_img.shape[:2]
-    cell_h = h / 9.0
-    cell_w = w / 9.0
-    clean = remove_grid_lines(warped_img)
-    _, buf = cv2.imencode('.png', clean)
-    b64 = base64.b64encode(buf).decode('utf-8')
-    payload = {
-        'apikey': API_KEY,
-        'base64Image': f'data:image/png;base64,{b64}',
-        'OCREngine': '2', # العودة للمحرك 2 الأفضل للأرقام
-        'isOverlayRequired': 'true',
-        'scale': 'true',
-    }
-    try:
-        resp = requests.post(OCR_URL, data=payload, timeout=30)
-        data = resp.json()
-        if data.get('IsErroredOnProcessing'):
-            return None, f"خطأ OCR: {data.get('ErrorMessage')}"
-        parsed = data.get('ParsedResults', [])
-        if not parsed:
-            return None, "لا توجد نتائج"
-        overlay = parsed[0].get('TextOverlay')
-        if overlay and overlay.get('Lines'):
-            for line in overlay['Lines']:
-                for word in line.get('Words', []):
-                    text = word.get('WordText', '')
-                    left = word.get('Left', 0)
-                    top = word.get('Top', 0)
-                    ww = max(word.get('Width', 1), 1)
-                    wh = max(word.get('Height', 1), 1)
-                    for ci, ch in enumerate(text):
-                        if ch.isdigit() and ch != '0':
-                            val = int(ch)
-                            if 1 <= val <= 9:
-                                if len(text) == 1:
-                                    cx = left + ww / 2
-                                else:
-                                    cx = left + (ci + 0.5) * ww / len(text)
-                                cy = top + wh / 2
-                                col = min(8, max(0, int(cx / cell_w)))
-                                row = min(8, max(0, int(cy / cell_h)))
-                                board[row][col] = val
-            return board, None
-        return None, "لا يوجد Overlay"
-    except Exception as e:
-        return None, str(e)
-
-def ocr_cell_by_cell(warped_img, filled_mask):
+def smart_extract_digits(warped_img):
     board = np.zeros((9, 9), dtype=int)
     gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
+    
+    # جمع الأرقام المعزولة
     cells_to_process = []
     for i in range(9):
         for j in range(9):
-            if filled_mask[i][j]:
-                inner = get_cell_inner(gray, i, j)
-                cells_to_process.append((i, j, inner))
+            inner = get_cell_inner(gray, i, j)
+            clean_digit_img = extract_clean_digit(inner)
+            if clean_digit_img is not None:
+                cells_to_process.append((i, j, clean_digit_img))
+                
     if not cells_to_process:
-        return board
+        return None
+        
     total = len(cells_to_process)
-    progress = st.progress(0, text=f"استخراج دقيق ({total} خلية)...")
-    for idx, (i, j, cell_img) in enumerate(cells_to_process):
-        resized = cv2.resize(cell_img, (100, 100), interpolation=cv2.INTER_CUBIC)
-        padded = cv2.copyMakeBorder(resized, 25, 25, 25, 25, cv2.BORDER_CONSTANT, value=255)
-        _, binary = cv2.threshold(padded, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, buf = cv2.imencode('.png', binary)
+    progress = st.progress(0, text=f"جاري قراءة {total} رقم بدقة عالية...")
+    
+    # عرض صورة مجمعة للأرقام المنظفة للمراقبة (Debug)
+    debug_montage = np.ones((9*100, 9*100), dtype=np.uint8) * 255
+    
+    for idx, (i, j, clean_img) in enumerate(cells_to_process):
+        debug_montage[i*100:(i+1)*100, j*100:(j+1)*100] = clean_img
+        
+        _, buf = cv2.imencode('.png', clean_img)
         b64 = base64.b64encode(buf).decode('utf-8')
         payload = {
             'apikey': API_KEY,
             'base64Image': f'data:image/png;base64,{b64}',
-            'OCREngine': '2',
+            'OCREngine': '2', # المحرك 2 ممتاز عندما تكون الصورة عبارة عن رقم واحد واضح جداً
             'scale': 'true',
         }
         try:
@@ -221,26 +193,16 @@ def ocr_cell_by_cell(warped_img, filled_mask):
                         break
         except Exception:
             pass
+            
         progress.progress((idx + 1) / total)
-        time.sleep(0.15)
-    progress.empty()
-    return board
-
-def smart_extract_digits(warped_img):
-    # نحاول استخراج الأرقام من الصورة كاملة أولاً (أسرع)
-    board, error = ocr_overlay_method(warped_img)
-    
-    # إذا تم استخراج الأرقام بنجاح (وجد أرقاماً في الشبكة)، نعتمدها
-    if board is not None and np.count_nonzero(board) > 0:
-        return board
+        time.sleep(0.15) # مهلة لتجنب حظر الـ API
         
-    # في حال فشلت الطريقة الأولى، نستخدم استخراج خلية بخلية
-    filled_mask = detect_filled_cells(warped_img)
-    board = ocr_cell_by_cell(warped_img, filled_mask)
+    progress.empty()
+    st.session_state.debug_clean = debug_montage
     return board
 
 # ==========================================
-# 5. خوارزمية الحل 
+# 4. خوارزمية الحل والتحقق
 # ==========================================
 def is_valid(board, r, c, num):
     for i in range(9):
@@ -277,12 +239,12 @@ def validate_board(board):
                 temp[i][j] = 0
                 if not is_valid(temp, i, j, v):
                     temp[i][j] = v
-                    return False, f"يوجد تعارض في الأرقام التي تمت قراءتها (تكرار للرقم {v})"
+                    return False, f"تعارض في قراءة الـ OCR (الرقم {v} مكرر بشكل خاطئ في الشبكة)"
                 temp[i][j] = v
     return True, ""
 
 # ==========================================
-# 6. الواقع المعزز 
+# 5. الواقع المعزز 
 # ==========================================
 def draw_solution(img, solved, original):
     ch = img.shape[0] // 9
@@ -343,9 +305,9 @@ if cv2_img is not None:
         SIZE = 450
         warped, warp_matrix = warp_image(cv2_img, contour, SIZE)
 
-        # سير العمل التلقائي بالكامل
         if not st.session_state.board_extracted:
             with st.spinner("⏳ جاري تحليل الصورة واستخراج الأرقام لحلها..."):
+                # استخدام الطريقة الجديدة والأكثر دقة
                 board = smart_extract_digits(warped)
                 
                 if board is not None and np.count_nonzero(board) > 0:
@@ -361,7 +323,6 @@ if cv2_img is not None:
                         if solve_sudoku(solved):
                             st.success("✅ تم التعرف على الأرقام وإيجاد الحل فوراً!")
                             
-                            # رسم الواقع المعزز مباشرة
                             ar = np.zeros((SIZE, SIZE, 3), np.uint8)
                             ar = draw_solution(ar, solved, board)
                             inv_M = cv2.getPerspectiveTransform(
@@ -375,17 +336,21 @@ if cv2_img is not None:
                             st.session_state.solved_board = solved
                             st.balloons()
                         else:
-                            st.error("⚠️ لم نتمكن من إيجاد حل. ربما قرأ الـ OCR رقماً خاطئاً بسبب دقة الصورة.")
+                            st.error("⚠️ لم نتمكن من إيجاد حل. الشبكة المستخرجة لا يوجد لها حل رياضي صحيح.")
                 else:
                     st.error("❌ لم نتمكن من استخراج أي أرقام صحيحة من الشبكة.")
                     
             st.session_state.board_extracted = True
 
-        # عرض النتيجة النهائية فقط
         if st.session_state.solved_img is not None:
             st.image(st.session_state.solved_img, channels="BGR", caption="✨ الحل التلقائي", use_container_width=True)
             with st.expander("📊 عرض الحل كجدول"):
                 st.dataframe(pd.DataFrame(st.session_state.solved_board, columns=[f"C{i}" for i in range(1, 10)], index=[f"R{i}" for i in range(1, 10)]), use_container_width=True)
+                
+        # قسم الشفافية لمعرفة كيف يرى البرنامج الأرقام (Debug)
+        if st.session_state.debug_clean is not None:
+            with st.expander("🛠️ كيف رأى الذكاء الاصطناعي الأرقام؟ (للتأكد من العزل)"):
+                st.image(st.session_state.debug_clean, caption="الأرقام المعزولة تماماً والمُرسلة للقراءة", use_container_width=True)
 
     else:
         st.error("❌ لم يتم العثور على شبكة سودوكو واضحة في الصورة.")
