@@ -2,19 +2,21 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-import fitz
+import fitz  # PyMuPDF
 import time
 import tensorflow as tf
+import hashlib
 
 # ==========================================
 # إعدادات الصفحة
 # ==========================================
 st.set_page_config(
-    page_title="Sudoku AR Solver (AI CNN)",
+    page_title="Sudoku AI Master Solver",
     page_icon="🤖",
     layout="centered"
 )
 
+# تهيئة الذاكرة (Session State)
 for key, default in {
     'img_hash': None,
     'board_extracted': False,
@@ -27,41 +29,38 @@ for key, default in {
         st.session_state[key] = default
 
 # ==========================================
-# 0. تحميل نموذج الذكاء الاصطناعي
+# 0. تحميل النموذج الذكي
 # ==========================================
 @st.cache_resource
 def load_digit_model():
-    model_path = 'model.h5' 
+    model_path = 'model.h5'
     try:
         model = tf.keras.models.load_model(model_path)
         return model
-    except Exception as e:
+    except:
         return None
 
 # ==========================================
-# 1. دوال معالجة الصور
+# 1. دوال معالجة الصور الأساسية
 # ==========================================
 def preprocess_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced_gray = clahe.apply(gray)
-    blur = cv2.GaussianBlur(enhanced_gray, (5, 5), 1)
-    thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-    )
-    return thresh
+    enhanced = clahe.apply(gray)
+    blur = cv2.GaussianBlur(enhanced, (5, 5), 1)
+    return cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
 
 def find_board(thresh_img):
     contours, _ = cv2.findContours(thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best = None
-    best_area = 0
+    max_area = 0
     for c in contours:
         area = cv2.contourArea(c)
-        if area > 20000:
+        if area > 25000:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and area > best_area:
-                best_area = area
+            if len(approx) == 4 and area > max_area:
+                max_area = area
                 best = approx
     return best
 
@@ -69,108 +68,81 @@ def order_points(pts):
     pts = pts.reshape((4, 2)).astype(np.float32)
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+    rect[0], rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
     d = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(d)]
-    rect[3] = pts[np.argmax(d)]
+    rect[1], rect[3] = pts[np.argmin(d)], pts[np.argmax(d)]
     return rect
 
 def warp_image(img, pts, size=450):
     src = order_points(pts)
     dst = np.float32([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]])
     M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(img, M, (size, size))
-    return warped, M
+    return cv2.warpPerspective(img, M, (size, size)), M
 
 # ==========================================
-# 2. الاستخراج والتجهيز للذكاء الاصطناعي
+# 2. استخراج الأرقام بالذكاء الاصطناعي 🧠
 # ==========================================
-def get_cell_inner(thresh_img, row, col, grid_size=450, margin=0.15):
-    cell_size = grid_size // 9
-    y1 = row * cell_size
-    x1 = col * cell_size
-    cell = thresh_img[y1:y1 + cell_size, x1:x1 + cell_size]
-    m = int(cell_size * margin)
-    inner = cell[m:cell_size - m, m:cell_size - m]
-    return inner
-
 def smart_extract_digits_cnn(warped_img, model):
     board = np.zeros((9, 9), dtype=int)
     gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
     
-    debug_montage = np.zeros((9*28, 9*28), dtype=np.uint8) 
-    progress = st.progress(0, text="🤖 الذكاء الاصطناعي يقرأ الشبكة الآن...")
+    debug_montage = np.zeros((9*28, 9*28), dtype=np.uint8)
+    progress = st.progress(0, text="🤖 الذكاء الاصطناعي يحلل الأرقام...")
     
-    cells_processed = 0
+    cell_size = 450 // 9
     for i in range(9):
         for j in range(9):
-            cell_inner = get_cell_inner(thresh, i, j, margin=0.10) 
-            kernel = np.ones((2,2), np.uint8)
-            cell_inner = cv2.morphologyEx(cell_inner, cv2.MORPH_OPEN, kernel)
+            # قص الخلية مع هامش ذكي
+            m = int(cell_size * 0.12)
+            cell = thresh[i*cell_size+m : (i+1)*cell_size-m, j*cell_size+m : (j+1)*cell_size-m]
             
-            contours, _ = cv2.findContours(cell_inner, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
+            contours, _ = cv2.findContours(cell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
-                largest_contour = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(largest_contour) > 25: 
-                    x, y, w, h = cv2.boundingRect(largest_contour)
-                    aspect_ratio = h / float(w)
-                    if 0.2 < aspect_ratio < 5.0:
-                        digit_roi = cell_inner[y:y+h, x:x+w]
-                        canvas = np.zeros((28, 28), dtype=np.uint8)
-                        scale = 20.0 / max(w, h)
-                        new_w, new_h = int(w * scale), int(h * scale)
-                        resized_digit = cv2.resize(digit_roi, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        
-                        start_x = (28 - new_w) // 2
-                        start_y = (28 - new_h) // 2
-                        canvas[start_y:start_y+new_h, start_x:start_x+new_w] = resized_digit
-                        
-                        # إزالة فلتر التسميك (dilate) لأنه قد يغلق فتحة الرقم 5 ليجعله 6
-                        debug_montage[i*28:(i+1)*28, j*28:(j+1)*28] = canvas
-                        
-                        cnn_input = canvas.reshape(1, 28, 28, 1).astype('float32') / 255.0
-                        prediction = model.predict(cnn_input, verbose=0)
-                        
-                        predicted_digit = np.argmax(prediction)
-                        confidence = np.max(prediction)
-                        
-                        if confidence > 0.60 and predicted_digit != 0:
-                            board[i][j] = predicted_digit
-                            
-            cells_processed += 1
-            progress.progress(cells_processed / 81)
+                c = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(c) > 30:
+                    x, y, w, h = cv2.boundingRect(c)
+                    digit = cell[y:y+h, x:x+w]
+                    
+                    # تجهيز للمقاس 28x28 (MNIST Style)
+                    canvas = np.zeros((28, 28), dtype=np.uint8)
+                    scale = 20.0 / max(w, h)
+                    nw, nh = int(w*scale), int(h*scale)
+                    res = cv2.resize(digit, (nw, nh), interpolation=cv2.INTER_AREA)
+                    canvas[(28-nh)//2 : (28-nh)//2+nh, (28-nw)//2 : (28-nw)//2+nw] = res
+                    
+                    debug_montage[i*28:(i+1)*28, j*28:(j+1)*28] = canvas
+                    
+                    # التنبؤ
+                    inp = canvas.reshape(1, 28, 28, 1).astype('float32') / 255.0
+                    pred = model.predict(inp, verbose=0)
+                    if np.max(pred) > 0.7 and np.argmax(pred) != 0:
+                        board[i][j] = np.argmax(pred)
+            
+            progress.progress(((i * 9 + j) + 1) / 81)
             
     progress.empty()
     st.session_state.debug_clean = debug_montage
     return board
 
 # ==========================================
-# 3. خوارزمية الحل والتحقق
+# 3. محرك حل السودوكو
 # ==========================================
-def is_valid(board, r, c, num):
-    for i in range(9):
-        if board[r][i] == num or board[i][c] == num:
-            return False
-    sr, sc = r - r % 3, c - c % 3
-    for i in range(3):
-        for j in range(3):
-            if board[sr + i][sc + j] == num:
-                return False
+def is_valid(b, r, c, n):
+    if n in b[r, :] or n in b[:, c]: return False
+    sr, sc = (r//3)*3, (c//3)*3
+    if n in b[sr:sr+3, sc:sc+3]: return False
     return True
 
-def solve_sudoku(board):
+def solve(b):
     for r in range(9):
         for c in range(9):
-            if board[r][c] == 0:
+            if b[r,c] == 0:
                 for n in range(1, 10):
-                    if is_valid(board, r, c, n):
-                        board[r][c] = n
-                        if solve_sudoku(board):
-                            return True
-                        board[r][c] = 0
+                    if is_valid(b, r, c, n):
+                        b[r,c] = n
+                        if solve(b): return True
+                        b[r,c] = 0
                 return False
     return True
 
@@ -178,144 +150,104 @@ def validate_board(board):
     temp = board.copy()
     for i in range(9):
         for j in range(9):
-            v = temp[i][j]
-            if v < 0 or v > 9:
-                return False, f"قيمة خارج النطاق ({v}) في الصف {i+1} والعمود {j+1}"
+            v = temp[i,j]
             if v != 0:
-                temp[i][j] = 0
-                if not is_valid(temp, i, j, v):
-                    temp[i][j] = v
-                    return False, f"تعارض: الرقم {v} متكرر في نفس الصف أو العمود أو المربع."
-                temp[i][j] = v
+                temp[i,j] = 0
+                if not is_valid(temp, i, j, v): return False, f"تكرار الرقم {v}"
+                temp[i,j] = v
     return True, ""
 
 # ==========================================
-# 4. الواقع المعزز
+# 4. رسم الحل (باللون الأحمر البارز) 🔴
 # ==========================================
 def draw_solution(img, solved, original):
-    ch = img.shape[0] // 9
-    cw = img.shape[1] // 9
+    h, w = img.shape[:2]
+    ch, cw = h // 9, w // 9
     for i in range(9):
         for j in range(9):
-            if original[i][j] == 0 and solved[i][j] != 0:
-                text = str(solved[i][j])
-                ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
-                tx = j * cw + (cw - ts[0]) // 2
-                ty = i * ch + (ch + ts[1]) // 2
-                cv2.putText(img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            if original[i,j] == 0 and solved[i,j] != 0:
+                txt = str(solved[i,j])
+                font = cv2.FONT_HERSHEY_DUPLEX
+                fs, thick = 1.3, 3
+                size = cv2.getTextSize(txt, font, fs, thick)[0]
+                tx = j*cw + (cw - size[0])//2
+                ty = i*ch + (ch + size[1])//2
+                # رسم الرقم باللون الأحمر
+                cv2.putText(img, txt, (tx, ty), font, fs, (0, 0, 255), thick)
     return img
 
 # ==========================================
-# واجهة المستخدم
+# واجهة التطبيق
 # ==========================================
-st.title("🤖 حلّال السودوكو الذكي (مع المصحح الآلي)")
-st.write("التقط صورة وسنقوم بالحل. إذا أخطأ الذكاء الاصطناعي في رقم، يمكنك تصحيحه بسهولة!")
+st.title("🤖 حلّال السودوكو الذكي النهائي")
+st.caption("يستخدم نموذج CNN مخصص لرؤية الأرقام وحلها آلياً")
 
-cnn_model = load_digit_model()
-if cnn_model is None:
-    st.error("⚠️ لم يتم العثور على ملف `model.h5`.")
+model = load_digit_model()
+if model is None:
+    st.error("⚠️ ملف model.h5 مفقود!")
     st.stop()
 
-method = st.radio("طريقة الإدخال:", ("📸 كاميرا", "📁 ملف (صورة/PDF)"), horizontal=True)
+choice = st.radio("المصدر:", ("📸 كاميرا", "📁 ملف"), horizontal=True)
+upload = st.camera_input("صوّر اللغز") if choice == "📸 كاميرا" else st.file_uploader("ارفع صورة", type=['png','jpg','jpeg','pdf'])
 
-cv2_img = None
-
-if method == "📸 كاميرا":
-    cam = st.camera_input("التقط صورة للسودوكو")
-    if cam:
-        cv2_img = cv2.imdecode(np.frombuffer(cam.getvalue(), np.uint8), cv2.IMREAD_COLOR)
-elif method == "📁 ملف (صورة/PDF)":
-    file = st.file_uploader("ارفع صورة أو PDF", type=['png', 'jpg', 'jpeg', 'pdf'])
-    if file:
-        if file.name.lower().endswith('.pdf'):
-            doc = fitz.open(stream=file.read(), filetype="pdf")
-            pix = doc[0].get_pixmap(dpi=200)
-            cv2_img = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
-            doc.close()
-        else:
-            cv2_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
-
-if cv2_img is not None:
-    img_hash = hash(cv2_img.tobytes()[:8000])
-    if st.session_state.img_hash != img_hash:
-        st.session_state.img_hash = img_hash
-        st.session_state.board_extracted = False
-        st.session_state.extracted_board = None
-        st.session_state.solved_img = None
-
-    thresh = preprocess_image(cv2_img)
-    contour = find_board(thresh)
-
-    if contour is not None:
-        SIZE = 450
-        warped, warp_matrix = warp_image(cv2_img, contour, SIZE)
-
-        # 1. الاستخراج
-        if not st.session_state.board_extracted:
-            with st.spinner("⏳ جاري تحليل الصورة..."):
-                board = smart_extract_digits_cnn(warped, cnn_model)
-                if board is not None and np.count_nonzero(board) > 0:
-                    st.session_state.extracted_board = board.copy()
-                    st.session_state.board_extracted = True
-                else:
-                    st.error("❌ لم نتمكن من العثور على أرقام واضحة.")
-
-        # 2. التحقق والتصحيح
-        if st.session_state.board_extracted and st.session_state.solved_img is None:
-            current_board = st.session_state.extracted_board.copy()
-            ok, msg = validate_board(current_board)
-            
-            if not ok:
-                st.warning(f"⚠️ {msg}")
-                st.info("الذكاء الاصطناعي أخطأ في قراءة رقم (مثل قراءة 5 على أنه 6). يرجى تصحيح الخطأ في الجدول أدناه (0 = خلية فارغة):")
-                
-                # عرض جدول قابل للتعديل
-                df = pd.DataFrame(current_board, columns=[f"C{i}" for i in range(1, 10)])
-                edited_df = st.data_editor(df, use_container_width=True)
-                
-                if st.button("🚀 أكمل الحل بعد التصحيح", type="primary"):
-                    corrected_board = edited_df.to_numpy().astype(int)
-                    ok2, msg2 = validate_board(corrected_board)
-                    if ok2:
-                        solved = corrected_board.copy()
-                        if solve_sudoku(solved):
-                            st.session_state.extracted_board = corrected_board # تحديث الأساس
-                            
-                            ar = np.zeros((SIZE, SIZE, 3), np.uint8)
-                            ar = draw_solution(ar, solved, corrected_board)
-                            inv_M = cv2.getPerspectiveTransform(
-                                np.float32([[0, 0], [SIZE - 1, 0], [SIZE - 1, SIZE - 1], [0, SIZE - 1]]), order_points(contour)
-                            )
-                            inv_warp = cv2.warpPerspective(ar, inv_M, (cv2_img.shape[1], cv2_img.shape[0]))
-                            st.session_state.solved_img = cv2.addWeighted(cv2_img, 1, inv_warp, 1, 0)
-                            st.rerun() # تحديث الصفحة لعرض النتيجة
-                        else:
-                            st.error("⚠️ لا يزال اللغز غير قابل للحل رياضياً.")
-                    else:
-                        st.error(f"❌ التعديل غير صحيح: {msg2}")
-            else:
-                # إذا كانت صحيحة 100%، يحلها فوراً
-                solved = current_board.copy()
-                if solve_sudoku(solved):
-                    ar = np.zeros((SIZE, SIZE, 3), np.uint8)
-                    ar = draw_solution(ar, solved, current_board)
-                    inv_M = cv2.getPerspectiveTransform(
-                        np.float32([[0, 0], [SIZE - 1, 0], [SIZE - 1, SIZE - 1], [0, SIZE - 1]]), order_points(contour)
-                    )
-                    inv_warp = cv2.warpPerspective(ar, inv_M, (cv2_img.shape[1], cv2_img.shape[0]))
-                    st.session_state.solved_img = cv2.addWeighted(cv2_img, 1, inv_warp, 1, 0)
-                    st.success("✅ تم التعرف والحل آلياً بنسبة 100%!")
-                    st.balloons()
-                else:
-                    st.error("⚠️ اللغز المستخرج غير قابل للحل.")
-
-        # 3. عرض النتيجة النهائية
-        if st.session_state.solved_img is not None:
-            st.image(st.session_state.solved_img, channels="BGR", caption="✨ الحل النهائي (الواقع المعزز)", use_container_width=True)
-            
-        if st.session_state.debug_clean is not None:
-            with st.expander("🛠️ كيف رأى الذكاء الاصطناعي الأرقام؟"):
-                st.image(st.session_state.debug_clean, use_container_width=True)
-
+if upload:
+    data = upload.getvalue()
+    if upload.name.lower().endswith('.pdf'):
+        doc = fitz.open(stream=data, filetype="pdf")
+        pix = doc[0].get_pixmap(dpi=200)
+        img = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), 1)
+        doc.close()
     else:
-        st.error("❌ لم يتم العثور على شبكة سودوكو واضحة.")
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), 1)
+
+    if img is not None:
+        h_val = hashlib.md5(img.tobytes()[:5000]).hexdigest()
+        if st.session_state.img_hash != h_val:
+            st.session_state.update({'img_hash':h_val, 'board_extracted':False, 'extracted_board':None, 'solved_img':None})
+
+        thresh = preprocess_image(img)
+        pts = find_board(thresh)
+
+        if pts is not None:
+            warped, M = warp_image(img, pts)
+            
+            if not st.session_state.board_extracted:
+                board = smart_extract_digits_cnn(warped, model)
+                if board is not None:
+                    st.session_state.update({'extracted_board':board, 'board_extracted':True})
+
+            if st.session_state.board_extracted and st.session_state.solved_img is None:
+                b = st.session_state.extracted_board.copy()
+                ok, msg = validate_board(b)
+                
+                if not ok:
+                    st.warning(f"⚠️ {msg}. صحح الأرقام أدناه:")
+                    df = pd.DataFrame(b, columns=[f"C{i+1}" for i in range(9)])
+                    new_df = st.data_editor(df)
+                    if st.button("🚀 حل الآن"):
+                        b = new_df.to_numpy().astype(int)
+                        ok2, _ = validate_board(b)
+                        if ok2:
+                            s_board = b.copy()
+                            if solve(s_board):
+                                ar = draw_solution(np.zeros((450,450,3), np.uint8), s_board, b)
+                                inv_M = cv2.getPerspectiveTransform(np.float32([[0,0],[449,0],[449,449],[0,449]]), order_points(pts))
+                                inv_w = cv2.warpPerspective(ar, inv_M, (img.shape[1], img.shape[0]))
+                                st.session_state.solved_img = cv2.addWeighted(img, 1, inv_w, 1, 0)
+                                st.rerun()
+                else:
+                    s_board = b.copy()
+                    if solve(s_board):
+                        ar = draw_solution(np.zeros((450,450,3), np.uint8), s_board, b)
+                        inv_M = cv2.getPerspectiveTransform(np.float32([[0,0],[449,0],[449,449],[0,449]]), order_points(pts))
+                        inv_w = cv2.warpPerspective(ar, inv_M, (img.shape[1], img.shape[0]))
+                        st.session_state.solved_img = cv2.addWeighted(img, 1, inv_w, 1, 0)
+                        st.success("✅ تم الحل بنجاح!")
+                        st.balloons()
+
+            if st.session_state.solved_img is not None:
+                st.image(st.session_state.solved_img, channels="BGR", use_container_width=True)
+                with st.expander("🛠️ المعاينة التقنية"):
+                    st.image(st.session_state.debug_clean, caption="الأرقام كما رآها الذكاء الاصطناعي")
+        else:
+            st.error("❌ لم يتم العثور على شبكة.")
