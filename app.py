@@ -86,7 +86,7 @@ def warp_image(img, pts, size=450):
     return warped, M
 
 # ==========================================
-# 2. كشف الخلايا الممتلئة 
+# 2. كشف الخلايا الممتلئة (احتياطي فقط)
 # ==========================================
 def get_cell_inner(gray, row, col, grid_size=450, margin=0.15):
     cell_size = grid_size // 9
@@ -103,16 +103,9 @@ def is_cell_filled(cell_gray):
     if total == 0: return False
     white = cv2.countNonZero(thresh)
     ratio = white / total
-    if ratio < 0.02 or ratio > 0.85:
+    if ratio < 0.01 or ratio > 0.95: # تم توسيع النطاق لعدم تفويت أرقام خفيفة
         return False
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area > total * 0.03:
-            _, _, cw, ch = cv2.boundingRect(c)
-            if cw > 0 and 0.2 < (ch / cw) < 6.0:
-                return True
-    return False
+    return True
 
 def detect_filled_cells(warped_img):
     gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
@@ -154,7 +147,7 @@ def ocr_overlay_method(warped_img):
     payload = {
         'apikey': API_KEY,
         'base64Image': f'data:image/png;base64,{b64}',
-        'OCREngine': '1', # تم التغيير إلى المحرك 1 ليكون أدق
+        'OCREngine': '2', # العودة للمحرك 2 الأفضل للأرقام
         'isOverlayRequired': 'true',
         'scale': 'true',
     }
@@ -187,7 +180,6 @@ def ocr_overlay_method(warped_img):
                                 col = min(8, max(0, int(cx / cell_w)))
                                 row = min(8, max(0, int(cy / cell_h)))
                                 board[row][col] = val
-            st.session_state.debug_clean = clean
             return board, None
         return None, "لا يوجد Overlay"
     except Exception as e:
@@ -215,7 +207,7 @@ def ocr_cell_by_cell(warped_img, filled_mask):
         payload = {
             'apikey': API_KEY,
             'base64Image': f'data:image/png;base64,{b64}',
-            'OCREngine': '1', # Engine 1 fallback
+            'OCREngine': '2',
             'scale': 'true',
         }
         try:
@@ -235,21 +227,15 @@ def ocr_cell_by_cell(warped_img, filled_mask):
     return board
 
 def smart_extract_digits(warped_img):
-    filled_mask = detect_filled_cells(warped_img)
-    expected_count = int(np.sum(filled_mask))
-    st.session_state.filled_mask = filled_mask
-    if expected_count == 0:
-        return None
-    
+    # نحاول استخراج الأرقام من الصورة كاملة أولاً (أسرع)
     board, error = ocr_overlay_method(warped_img)
-    if board is not None:
-        detected = int(np.count_nonzero(board))
-        if detected >= expected_count * 0.5:
-            for i in range(9):
-                for j in range(9):
-                    if board[i][j] != 0 and not filled_mask[i][j]:
-                        board[i][j] = 0
-            return board
+    
+    # إذا تم استخراج الأرقام بنجاح (وجد أرقاماً في الشبكة)، نعتمدها
+    if board is not None and np.count_nonzero(board) > 0:
+        return board
+        
+    # في حال فشلت الطريقة الأولى، نستخدم استخراج خلية بخلية
+    filled_mask = detect_filled_cells(warped_img)
     board = ocr_cell_by_cell(warped_img, filled_mask)
     return board
 
@@ -291,7 +277,7 @@ def validate_board(board):
                 temp[i][j] = 0
                 if not is_valid(temp, i, j, v):
                     temp[i][j] = v
-                    return False, f"يوجد تكرار للرقم {v} في الصورة الأصلية"
+                    return False, f"يوجد تعارض في الأرقام التي تمت قراءتها (تكرار للرقم {v})"
                 temp[i][j] = v
     return True, ""
 
@@ -362,12 +348,14 @@ if cv2_img is not None:
             with st.spinner("⏳ جاري تحليل الصورة واستخراج الأرقام لحلها..."):
                 board = smart_extract_digits(warped)
                 
-                if board is not None:
+                if board is not None and np.count_nonzero(board) > 0:
                     st.session_state.original_board = board.copy()
                     ok, msg = validate_board(board.copy())
                     
                     if not ok:
-                        st.error(f"❌ لم تنجح الأتمتة بالكامل بسبب جودة الصورة: {msg}")
+                        st.error(f"❌ تم استخراج الأرقام لكن يوجد بها خطأ يمنع الحل: {msg}")
+                        with st.expander("الأرقام المستخرجة (بها أخطاء)"):
+                            st.dataframe(pd.DataFrame(board))
                     else:
                         solved = board.copy()
                         if solve_sudoku(solved):
@@ -389,7 +377,7 @@ if cv2_img is not None:
                         else:
                             st.error("⚠️ لم نتمكن من إيجاد حل. ربما قرأ الـ OCR رقماً خاطئاً بسبب دقة الصورة.")
                 else:
-                    st.error("❌ لم نتمكن من استخراج أي أرقام من الشبكة.")
+                    st.error("❌ لم نتمكن من استخراج أي أرقام صحيحة من الشبكة.")
                     
             st.session_state.board_extracted = True
 
