@@ -1,7 +1,8 @@
+
 streamlit
 opencv-python-headless
 numpy
-requests
+pytesseract
+PyMuPDF
 pandas
-pymupdf
-
+requests
