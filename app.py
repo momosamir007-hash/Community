@@ -8,7 +8,7 @@ import pandas as pd
 # ==========================================
 # إعدادات الـ API (Cloud OCR)
 # ==========================================
-API_KEY = 'helloworld'  # يفضل تغييره بمفتاحك الخاص من ocr.space
+API_KEY = st.secrets["OCR_API_KEY"]
 OCR_URL = 'https://api.ocr.space/parse/image'
 
 # ==========================================
