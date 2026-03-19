@@ -1,1056 +1,889 @@
-
-# ══════════════════════════════════════════════════════════════
-# SudokuSense AI — النسخة المُصحَّحة والمُحدَّثة
-# ══════════════════════════════════════════════════════════════
-
 import streamlit as st
-
-# ⚠️ يجب أن يكون أول أمر Streamlit قبل أي st.error / st.stop
-st.set_page_config(
-    page_title="SudokuSense AI",
-    page_icon="🧩",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
-
-import streamlit.components.v1 as components
 import cv2
 import numpy as np
-from PIL import Image
-import sys
-import os
-import copy
-import zipfile
-import tempfile
+import pandas as pd
+import fitz  # PyMuPDF
 import time
+import tensorflow as tf
+import hashlib
+from io import BytesIO
 
-# ─── مسارات المشروع ───
-sys.path.append("./ImageProcess")
-sys.path.append("./Results")
-sys.path.append("./Solver")
-
-# ─── TensorFlow ───
-try:
-    import tensorflow as tf
-
-    TF_VERSION = tf.__version__
-except ImportError:
-    st.error("⚠️ TensorFlow غير مثبت! `pip install tensorflow`")
-    st.stop()
-
-# ─── وحدات المشروع (اختياري) ───
-try:
-    from processing import main_processing
-except ImportError:
-    main_processing = None
-
-try:
-    from solver import mainSolver
-except ImportError:
-    mainSolver = None
-
-# ══════════════════════════════════════════════════════════════
-# ثوابت عامة
-# ══════════════════════════════════════════════════════════════
-CONFUSED_PAIRS = {1: [7], 7: [1], 9: [4], 4: [9], 5: [2], 2: [5]}
-GRID_SIZE = 9
-CELL_PX = 50  # حجم الخلية في الصورة المقصوصة
-WARP_SIZE = CELL_PX * GRID_SIZE  # 450
-DEFAULTS = dict(
-    grid=None,
-    solved=None,
-    original=None,
-    confidence=None,
-    alternatives=None,
-    uncertain=set(),
-    corrections=[],
-    form_ver=0,  # عداد لتحديث مفاتيح النموذج
+# ==========================================
+# إعدادات الصفحة
+# ==========================================
+st.set_page_config(
+    page_title="Sudoku AI Master Solver",
+    page_icon="🤖",
+    layout="centered"
 )
 
+# ==========================================
+# تهيئة Session State
+# ==========================================
+defaults = {
+    'img_hash': None,
+    'board_extracted': False,
+    'extracted_board': None,
+    'confidences': None,
+    'solved_img': None,
+    'solved_board': None,
+    'debug_clean': None,
+    'warped_img': None,
+    'original_img': None,
+    'pts': None,
+    'history': [],
+}
 
-# ══════════════════════════════════════════════════════════════
-# 1 · تحميل النموذج (6 طرق احتياطية)
-# ══════════════════════════════════════════════════════════════
-def _build_original_model():
-    """يبني البنية الأصلية يدوياً (نفس أسماء الطبقات في الملف)."""
-    m = tf.keras.models.Sequential(
-        [
-            tf.keras.layers.Conv2D(
-                32, (5, 5), padding="same", activation="relu", input_shape=(28, 28, 1), name="conv2d"
-            ),
-            tf.keras.layers.Conv2D(32, (5, 5), padding="same", activation="relu", name="conv2d_1"),
-            tf.keras.layers.MaxPooling2D((2, 2), name="max_pooling2d"),
-            tf.keras.layers.Dropout(0.25, name="dropout"),
-            tf.keras.layers.Conv2D(64, (3, 3), padding="same", activation="relu", name="conv2d_2"),
-            tf.keras.layers.Conv2D(64, (3, 3), padding="same", activation="relu", name="conv2d_3"),
-            tf.keras.layers.MaxPooling2D((2, 2), strides=2, name="max_pooling2d_1"),
-            tf.keras.layers.Dropout(0.25, name="dropout_1"),
-            tf.keras.layers.Flatten(name="flatten"),
-            tf.keras.layers.Dense(128, activation="relu", name="dense"),
-            tf.keras.layers.Dropout(0.5, name="dropout_2"),
-            tf.keras.layers.Dense(10, activation="softmax", name="dense_1"),
-        ]
-    )
-    m.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    # بناء الطبقات
-    m.predict(np.zeros((1, 28, 28, 1), dtype=np.float32), verbose=0)
-    return m
+for key, default in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-
-def _extract_h5_from_keras_zip(path):
-    """ملف .keras = ZIP يحوي model.weights.h5 — نستخرجه."""
-    try:
-        tmp = tempfile.mkdtemp()
-        with zipfile.ZipFile(path, "r") as zf:
-            for name in zf.namelist():
-                if name.endswith(".h5"):
-                    out = os.path.join(tmp, "w.h5")
-                    with open(out, "wb") as f:
-                        f.write(zf.read(name))
-                    return out
-    except (zipfile.BadZipFile, Exception):
-        pass
-    return None
-
-
+# ==========================================
+# 0. تحميل النموذج
+# ==========================================
 @st.cache_resource
-def load_ai_model():
-    """يحاول 6 طرق لتحميل النموذج بأي إصدار Keras."""
-    # البحث عن الملف
-    path = None
-    for p in ("model.keras", "model.h5", "model_weights.weights.h5", "model_weights.h5"):
-        if os.path.exists(p):
-            path = p
-            break
-    if path is None:
-        return None, "لم يُعثر على أي ملف نموذج"
-
-    errors = []
-
-    # --- الطريقة 1 : تحميل مباشر ---
+def load_digit_model():
     try:
-        return tf.keras.models.load_model(path), "تحميل مباشر ✅"
+        model = tf.keras.models.load_model('model.h5')
+        return model
     except Exception as e:
-        errors.append(f"1) {e}")
+        return None
 
-    # --- الطريقة 2 : compile=False ---
-    try:
-        m = tf.keras.models.load_model(path, compile=False)
-        m.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-        return m, "compile=False ✅"
-    except Exception as e:
-        errors.append(f"2) {e}")
+# ==========================================
+# 1. دوال معالجة الصور (محسّنة)
+# ==========================================
+def resize_if_needed(img, max_size=1500, min_size=300):
+    """ضبط حجم الصورة تلقائياً"""
+    h, w = img.shape[:2]
+    if max(h, w) > max_size:
+        scale = max_size / max(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale)
+    elif max(h, w) < min_size:
+        scale = 600 / max(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale)
+    return img
 
-    # --- الطريقة 3 : safe_mode=False ---
-    try:
-        m = tf.keras.models.load_model(path, compile=False, safe_mode=False)
-        m.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-        return m, "safe_mode=False ✅"
-    except Exception as e:
-        errors.append(f"3) {e}")
-
-    # --- الطريقة 4 : بناء يدوي + load_weights ---
-    try:
-        m = _build_original_model()
-        m.load_weights(path)
-        return m, "بناء يدوي + أوزان ✅"
-    except Exception as e:
-        errors.append(f"4) {e}")
-
-    # --- الطريقة 5 : استخراج H5 من ZIP ---
-    if path.endswith(".keras"):
-        w = _extract_h5_from_keras_zip(path)
-        if w:
-            try:
-                m = _build_original_model()
-                m.load_weights(w)
-                try:
-                    os.remove(w)
-                except OSError:
-                    pass
-                return m, "استخراج من ZIP ✅"
-            except Exception as e:
-                errors.append(f"5) {e}")
-
-    # --- الطريقة 6 : ملفات أوزان منفصلة ---
-    for wf in ("model_weights.weights.h5", "model_weights.h5", "weights.h5"):
-        if os.path.exists(wf) and wf != path:
-            try:
-                m = _build_original_model()
-                m.load_weights(wf)
-                return m, f"أوزان منفصلة ({wf}) ✅"
-            except Exception as e:
-                errors.append(f"6-{wf}) {e}")
-
-    return None, "\n".join(errors)
-
-
-# ══════════════════════════════════════════════════════════════
-# 2 · معالجة الصورة واستخراج الشبكة
-# ══════════════════════════════════════════════════════════════
-def binarize(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+def preprocess_image(img, clip_limit=2.0, block_size=11, c_val=2):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    blur = cv2.GaussianBlur(enhanced, (5, 5), 1)
     return cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 4,
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block_size,
+        c_val
     )
 
-
-def find_grid_contour(binary):
-    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = sorted(
-        [c for c in cnts if cv2.contourArea(c) > 1000],
-        key=cv2.contourArea,
-        reverse=True,
+def find_board(thresh_img):
+    contours, _ = cv2.findContours(
+        thresh_img,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
     )
-    for cnt in cnts:
-        eps = 0.02 * cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, eps, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2)
-    return None
+    best = None
+    max_area = 0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > 25000:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4 and area > max_area:
+                max_area = area
+                best = approx
+    return best
 
+def find_board_hough(img):
+    """اكتشاف الشبكة عبر خطوط Hough كخطة بديلة"""
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=100,
+            minLineLength=100,
+            maxLineGap=10
+        )
+        if lines is None:
+            return None
+        horizontal, vertical = [], []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.degrees(np.arctan2(abs(y2 - y1), abs(x2 - x1)))
+            length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if angle < 15 and length > 80:
+                horizontal.append(line[0])
+            elif angle > 75 and length > 80:
+                vertical.append(line[0])
+        if len(horizontal) < 2 or len(vertical) < 2:
+            return None
+        h_arr = np.array(horizontal)
+        v_arr = np.array(vertical)
+        min_y = min(h_arr[:, 1].min(), h_arr[:, 3].min())
+        max_y = max(h_arr[:, 1].max(), h_arr[:, 3].max())
+        min_x = min(v_arr[:, 0].min(), v_arr[:, 2].min())
+        max_x = max(v_arr[:, 0].max(), v_arr[:, 2].max())
+        if (max_y - min_y) < 100 or (max_x - min_x) < 100:
+            return None
+        pts = np.array([
+            [[min_x, min_y]],
+            [[max_x, min_y]],
+            [[max_x, max_y]],
+            [[min_x, max_y]]
+        ], dtype=np.float32)
+        return pts
+    except:
+        return None
 
-def _order_points(pts):
-    """ترتيب 4 نقاط: أعلى-يسار، أعلى-يمين، أسفل-يمين، أسفل-يسار."""
+def find_board_robust(img):
+    """محاولات متعددة بمعاملات مختلفة لإيجاد الشبكة"""
+    params = [
+        (2.0, 11, 2),
+        (3.0, 11, 2),
+        (2.0, 15, 3),
+        (4.0, 11, 4),
+        (2.0, 7, 2),
+        (3.0, 15, 4),
+        (5.0, 11, 2),
+    ]
+    for clip, block, c in params:
+        thresh = preprocess_image(img, clip, block, c)
+        pts = find_board(thresh)
+        if pts is not None:
+            return pts, thresh
+    # خطة بديلة: Hough Lines
+    pts = find_board_hough(img)
+    if pts is not None:
+        thresh = preprocess_image(img)
+        return pts, thresh
+    return None, None
+
+def order_points(pts):
+    pts = pts.reshape((4, 2)).astype(np.float32)
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
     rect[0] = pts[np.argmin(s)]
     rect[2] = pts[np.argmax(s)]
+    d = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(d)]
     rect[3] = pts[np.argmax(d)]
     return rect
 
+def warp_image(img, pts, size=450):
+    src = order_points(pts)
+    dst = np.float32([
+        [0, 0],
+        [size - 1, 0],
+        [size - 1, size - 1],
+        [0, size - 1]
+    ])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (size, size)), M
 
-def split_grid_into_cells(binary, contour):
-    """
-    بديل احتياطي لـ main_processing: يقص الشبكة بـ Perspective Transform
-    ثم يقسمها لـ 81 خلية.
-    """
-    pts = _order_points(contour.astype(np.float32))
-    dst = np.array(
-        [[0, 0], [WARP_SIZE, 0], [WARP_SIZE, WARP_SIZE], [0, WARP_SIZE]],
-        dtype=np.float32,
+# ==========================================
+# 2. استخراج الأرقام (محسّن بالكامل)
+# ==========================================
+def prepare_cell(cell):
+    """استخراج الرقم من الخلية وتجهيزه بمقاس 28×28"""
+    if cell is None or cell.size == 0:
+        return None
+    contours, _ = cv2.findContours(
+        cell,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
     )
-    M = cv2.getPerspectiveTransform(pts, dst)
-    warped = cv2.warpPerspective(binary, M, (WARP_SIZE, WARP_SIZE))
+    if not contours:
+        return None
+    c = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(c) < 30:
+        return None
+    x, y, w, h = cv2.boundingRect(c)
+    if w < 3 or h < 3:
+        return None
+    digit = cell[y:y + h, x:x + w]
+    if digit.size == 0:
+        return None
+    canvas = np.zeros((28, 28), dtype=np.uint8)
+    scale = 20.0 / max(w, h)
+    nw = max(int(w * scale), 1)
+    nh = max(int(h * scale), 1)
+    res = cv2.resize(digit, (nw, nh), interpolation=cv2.INTER_AREA)
+    oy = (28 - nh) // 2
+    ox = (28 - nw) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = res
+    return canvas
+
+def get_cell_multi_threshold(gray_cell):
+    """إنشاء نسخ متعددة بطرق threshold مختلفة"""
     cells = []
-    for row in range(9):
-        for col in range(9):
-            y1 = row * CELL_PX
-            x1 = col * CELL_PX
-            cell = warped[y1 : y1 + CELL_PX, x1 : x1 + CELL_PX]
-            # هل الخلية تحتوي رقماً؟
-            # قص الهوامش أولاً
-            m = int(CELL_PX * 0.15)
-            inner = cell[m : CELL_PX - m, m : CELL_PX - m]
-            has_digit = np.sum(inner > 0) > (inner.size * 0.04)
-            cells.append([cell, col, row, has_digit])
-    return True, cells, warped
-
-
-# ══════════════════════════════════════════════════════════════
-# 3 · معالجة خلية الرقم الواحد
-# ══════════════════════════════════════════════════════════════
-def _preprocess_cell(cell_img):
-    """
-    يعيد قائمة نسخ (28×28 float32) جاهزة للنموذج.
-    - CLAHE + عتبتان مختلفتان
-    - قلب تلقائي للألوان
-    - حفظ نسبة الأبعاد
-    - توسيط بمركز الكتلة
-    """
-    if cell_img is None or cell_img.size == 0:
-        return []
-    gray = (
-        cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
-        if len(cell_img.shape) == 3
-        else cell_img.copy()
-    )
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
-
-    # عتبتان
-    _, t_otsu = cv2.threshold(
-        enhanced, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
-    )
-    t_adapt = cv2.adaptiveThreshold(
-        enhanced,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11,
-        2,
-    )
-
-    versions = []
-    for thresh in (t_otsu, t_adapt):
-        # قلب تلقائي
-        if cv2.countNonZero(thresh) > thresh.size // 2:
-            thresh = cv2.bitwise_not(thresh)
-
-        h, w = thresh.shape
-        mg = int(min(h, w) * 0.15)
-        crop = thresh[mg : h - mg, mg : w - mg]
-
-        # إزالة الغبار
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        crop = cv2.morphologyEx(crop, cv2.MORPH_OPEN, kernel)
-
-        cnts, _ = cv2.findContours(crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            continue
-        cnt = max(cnts, key=cv2.contourArea)
-        if cv2.contourArea(cnt) < 25:
-            continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw < 3 or bh < 5:
-            continue
-
-        digit = crop[y : y + bh, x : x + bw]
-
-        # حفظ نسبة الأبعاد → تصغير أطول ضلع إلى 20
-        scale = 20.0 / max(bw, bh)
-        nw = max(int(bw * scale), 1)
-        nh = max(int(bh * scale), 1)
-        resized = cv2.resize(digit, (nw, nh), interpolation=cv2.INTER_AREA)
-
-        # لوحة 28×28 مع التوسيط بمركز الكتلة
-        canvas = np.zeros((28, 28), dtype=np.float32)
-
-        # مركز الكتلة
-        moments = cv2.moments(resized)
-        if moments["m00"] > 0:
-            cx = int(moments["m10"] / moments["m00"])
-            cy = int(moments["m01"] / moments["m00"])
-        else:
-            cx, cy = nw // 2, nh // 2
-
-        ox = max(14 - cx, 0)
-        oy = max(14 - cy, 0)
-
-        # تأكد من عدم الخروج عن الحدود
-        end_x = min(ox + nw, 28)
-        end_y = min(oy + nh, 28)
-        src_w = end_x - ox
-        src_h = end_y - oy
-
-        canvas[oy:end_y, ox:end_x] = (
-            resized[:src_h, :src_w].astype(np.float32) / 255.0
+    try:
+        _, t1 = cv2.threshold(
+            gray_cell,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
         )
-        versions.append(canvas)
+        cells.append(t1)
+    except:
+        pass
+    try:
+        t2 = cv2.adaptiveThreshold(
+            gray_cell,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            11,
+            2
+        )
+        cells.append(t2)
+    except:
+        pass
+    try:
+        t3 = cv2.adaptiveThreshold(
+            gray_cell,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            11,
+            2
+        )
+        cells.append(t3)
+    except:
+        pass
+    return cells
 
+def augment_canvas(canvas):
+    """إنشاء نسخ معدّلة (TTA) من صورة 28×28"""
+    versions = [canvas]
+    # تدوير بسيط
+    for angle in [-5, 5]:
+        M = cv2.getRotationMatrix2D((14, 14), angle, 1.0)
+        rotated = cv2.warpAffine(canvas, M, (28, 28))
+        versions.append(rotated)
+    # إزاحة بسيطة
+    for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+        M_s = np.float32([[1, 0, dx], [0, 1, dy]])
+        shifted = cv2.warpAffine(canvas, M_s, (28, 28))
+        versions.append(shifted)
     return versions
 
+def extract_digits_batch(warped_img, model, use_tta=True, conf_threshold=0.7):
+    """
+    استخراج الأرقام بدفعة واحدة مع:
+    - Multi-threshold
+    - TTA (Test-Time Augmentation)
+    - Batch Prediction ⚡
+    """
+    board = np.zeros((9, 9), dtype=int)
+    confidences = np.zeros((9, 9), dtype=float)
+    gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
+    debug_montage = np.zeros((9 * 28, 9 * 28), dtype=np.uint8)
+    cell_size = 450 // 9
+    cell_data = {}
+    progress = st.progress(0, text="🤖 تحليل الخلايا...")
 
-# ══════════════════════════════════════════════════════════════
-# 4 · التعرف مع الثقة + TTA
-# ══════════════════════════════════════════════════════════════
-def recognize_with_confidence(images, model, threshold=0.75):
-    grid = [[0] * 9 for _ in range(9)]
-    conf = [[1.0] * 9 for _ in range(9)]
-    alts = [[[] for _ in range(9)] for _ in range(9)]
-    uncertain = set()
-
-    for item in images:
-        cell_img, cx, cy, has = item[0], item[1], item[2], item[3]
-        if not has:
-            continue
-
-        cell_versions = _preprocess_cell(cell_img)
-        if not cell_versions:
-            continue
-
-        # TTA: إزاحة ±1 بكسل أفقياً ورأسياً
-        augmented = []
-        for v in cell_versions:
-            augmented.append(v)
-            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                M = np.float32([[1, 0, dx], [0, 1, dy]])
-                augmented.append(cv2.warpAffine(v, M, (28, 28), borderValue=0))
-
-        batch = np.array(augmented).reshape(-1, 28, 28, 1)
-        preds = model.predict(batch, verbose=0)
-        avg = np.mean(preds, axis=0)
-        top = [i for i in np.argsort(avg)[::-1] if i != 0][:5]
-        if not top:
-            continue
-
-        pred = top[0]
-        c_val = float(avg[pred])
-        grid[cy][cx] = pred
-        conf[cy][cx] = c_val
-        alts[cy][cx] = [(int(i), float(avg[i])) for i in top]
-
-        # فحص الأزواج المتشابهة
-        if pred in CONFUSED_PAIRS:
-            for cd in CONFUSED_PAIRS[pred]:
-                if float(avg[cd]) > c_val * 0.35:
-                    uncertain.add((cy, cx))
-        if c_val < threshold:
-            uncertain.add((cy, cx))
-
-    return grid, conf, alts, uncertain
-
-
-# ══════════════════════════════════════════════════════════════
-# 5 · كشف التعارضات + التصحيح التلقائي
-# ══════════════════════════════════════════════════════════════
-def find_conflicts(grid):
-    bad = set()
+    # ────── المرحلة 1: جمع جميع الخلايا ──────
     for i in range(9):
-        # صف
-        seen = {}
         for j in range(9):
-            v = grid[i][j]
-            if v:
-                if v in seen:
-                    bad.add((i, j))
-                    bad.add((i, seen[v]))
-                seen[v] = j
-        # عمود
-        seen = {}
-        for j in range(9):
-            v = grid[j][i]
-            if v:
-                if v in seen:
-                    bad.add((j, i))
-                    bad.add((seen[v], i))
-                seen[v] = j
-        # مربعات 3×3
-        for br in range(3):
-            for bc in range(3):
-                seen = {}
-                for dr in range(3):
-                    for dc in range(3):
-                        r, c = br * 3 + dr, bc * 3 + dc
-                        v = grid[r][c]
-                        if v:
-                            if v in seen:
-                                bad.add((r, c))
-                                bad.add(seen[v])
-                            seen[v] = (r, c)
-    return bad
-
-
-def auto_correct(grid, confidence, alternatives):
-    g = copy.deepcopy(grid)
-    cf = copy.deepcopy(confidence)
-    fixes = []
-    for _ in range(40):
-        conflicts = find_conflicts(g)
-        if not conflicts:
-            break
-
-        # الأضعف ثقة
-        worst, wc = None, 999.0
-        for pos in conflicts:
-            if cf[pos[0]][pos[1]] < wc:
-                wc = cf[pos[0]][pos[1]]
-                worst = pos
-        if worst is None:
-            break
-
-        r, c = worst
-        old = g[r][c]
-        fixed = False
-        for av, ac in alternatives[r][c]:
-            if av == old or av == 0:
+            m = int(cell_size * 0.12)
+            y1, y2 = i * cell_size + m, (i + 1) * cell_size - m
+            x1, x2 = j * cell_size + m, (j + 1) * cell_size - m
+            gray_cell = gray[y1:y2, x1:x2]
+            if gray_cell.size == 0:
                 continue
-            g[r][c] = av
-            if len(find_conflicts(g)) < len(conflicts):
-                fixes.append(
-                    dict(
-                        row=r,
-                        col=c,
-                        old=old,
-                        new=av,
-                        old_conf=wc,
-                        new_conf=ac,
-                    )
-                )
-                cf[r][c] = ac
-                fixed = True
-                break
-        if not fixed:
-            cf[r][c] = 999
-    return g, fixes
 
+            # Multi-threshold
+            thresh_versions = get_cell_multi_threshold(gray_cell)
+            canvases = []
+            first_canvas = None
+            for tv in thresh_versions:
+                c = prepare_cell(tv)
+                if c is not None:
+                    if first_canvas is None:
+                        first_canvas = c
+                    canvases.append(c)
 
-# ══════════════════════════════════════════════════════════════
-# 6 · حل السودوكو
-# ══════════════════════════════════════════════════════════════
-def _ok(g, r, c, n):
-    if n in g[r]:
+            if canvases and first_canvas is not None:
+                debug_montage[i * 28:(i + 1) * 28, j * 28:(j + 1) * 28] = first_canvas
+
+                # TTA
+                if use_tta:
+                    augmented = augment_canvas(first_canvas)
+                    canvases.extend(augmented[1:])
+
+                cell_data[(i, j)] = canvases
+            progress.progress(((i * 9 + j) + 1) / 81)
+    progress.empty()
+
+    # ────── المرحلة 2: تنبؤ بدفعة واحدة ⚡ ──────
+    if cell_data:
+        all_images = []
+        cell_indices = []
+        for (i, j), canvases in cell_data.items():
+            for canvas in canvases:
+                all_images.append(canvas)
+                cell_indices.append((i, j))
+
+        if all_images:
+            batch = np.array(all_images).reshape(
+                -1, 28, 28, 1
+            ).astype('float32') / 255.0
+
+            with st.spinner(f"⚡ تنبؤ دفعة واحدة ({len(all_images)} صورة)..."):
+                predictions = model.predict(batch, verbose=0)
+
+            # تجميع التنبؤات لكل خلية
+            cell_preds = {}
+            for idx, (i, j) in enumerate(cell_indices):
+                if (i, j) not in cell_preds:
+                    cell_preds[(i, j)] = []
+                cell_preds[(i, j)].append(predictions[idx])
+
+            for (i, j), preds in cell_preds.items():
+                avg_pred = np.mean(preds, axis=0)
+                digit = int(np.argmax(avg_pred))
+                conf = float(avg_pred[digit])
+                if conf > conf_threshold and digit != 0:
+                    board[i][j] = digit
+                    confidences[i][j] = conf
+
+    st.session_state.debug_clean = debug_montage
+    return board, confidences
+
+# ==========================================
+# 3. محرك حل السودوكو
+# ==========================================
+def is_valid(b, r, c, n):
+    if n in b[r, :] or n in b[:, c]:
         return False
-    if any(g[i][c] == n for i in range(9)):
+    sr, sc = (r // 3) * 3, (c // 3) * 3
+    if n in b[sr:sr + 3, sc:sc + 3]:
         return False
-    sr, sc = 3 * (r // 3), 3 * (c // 3)
-    for i in range(sr, sr + 3):
-        for j in range(sc, sc + 3):
-            if g[i][j] == n:
+    return True
+
+def solve(b):
+    for r in range(9):
+        for c in range(9):
+            if b[r, c] == 0:
+                for n in range(1, 10):
+                    if is_valid(b, r, c, n):
+                        b[r, c] = n
+                        if solve(b):
+                            return True
+                        b[r, c] = 0
                 return False
     return True
 
-
-def _bt(g):
+def validate_board(board):
     for i in range(9):
         for j in range(9):
-            if g[i][j] == 0:
-                for n in range(1, 10):
-                    if _ok(g, i, j, n):
-                        g[i][j] = n
-                        if _bt(g):
-                            return True
-                        g[i][j] = 0
-                return False
-    return True
+            v = board[i, j]
+            if v != 0:
+                temp = board.copy()
+                temp[i, j] = 0
+                if not is_valid(temp, i, j, v):
+                    return False, f"تكرار الرقم {v} في الموقع [صف {i+1}, عمود {j+1}]"
+    return True, ""
 
-
-def solve_puzzle(grid):
-    # المحلّل الأصلي أولاً
-    if mainSolver is not None:
-        try:
-            res = mainSolver(copy.deepcopy(grid))
-            if isinstance(res, list) and res != -1:
-                return res
-        except Exception:
-            pass
-    # Backtracking
-    g = copy.deepcopy(grid)
-    return g if _bt(g) else None
-
-
-# ══════════════════════════════════════════════════════════════
-# 7 · رسم الشبكة (صورة OpenCV + HTML)
-# ══════════════════════════════════════════════════════════════
-def draw_sudoku_image(grid, original=None):
-    C = 64
-    S = C * 9
-    img = np.ones((S, S, 3), dtype=np.uint8) * 255
-
-    for br in range(3):
-        for bc in range(3):
-            if (br + bc) % 2 == 0:
-                y0, x0 = br * 3 * C, bc * 3 * C
+# ==========================================
+# 4. رسم الحل على الصورة
+# ==========================================
+def draw_solution_on_warped(warped_img, solved, original):
+    result = warped_img.copy()
+    h, w = result.shape[:2]
+    ch, cw = h // 9, w // 9
+    for i in range(9):
+        for j in range(9):
+            if original[i, j] == 0 and solved[i, j] != 0:
+                txt = str(solved[i, j])
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                fs, thick = 1.2, 2
+                sz = cv2.getTextSize(txt, font, fs, thick)[0]
+                tx = j * cw + (cw - sz[0]) // 2
+                ty = i * ch + (ch + sz[1]) // 2
+                pad = 4
                 cv2.rectangle(
-                    img,
-                    (x0, y0),
-                    (x0 + 3 * C, y0 + 3 * C),
-                    (235, 232, 248),
-                    -1,
+                    result,
+                    (tx - pad, ty - sz[1] - pad),
+                    (tx + sz[0] + pad, ty + pad),
+                    (255, 255, 255),
+                    -1
                 )
-
-    for i in range(10):
-        t = 4 if i % 3 == 0 else 1
-        cl = (26, 35, 126) if i % 3 == 0 else (180, 180, 180)
-        p = i * C
-        cv2.line(img, (0, p), (S, p), cl, t)
-        cv2.line(img, (p, 0), (p, S), cl, t)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    for y in range(9):
-        for x in range(9):
-            v = int(grid[y][x])
-            if v:
-                orig = original and int(original[y][x]) != 0
-                color = (126, 35, 26) if orig else (30, 120, 30)
-                txt = str(v)
-                ts = cv2.getTextSize(txt, font, 1.4, 2)[0]
                 cv2.putText(
-                    img,
+                    result,
                     txt,
-                    (
-                        x * C + (C - ts[0]) // 2,
-                        y * C + (C + ts[1]) // 2,
-                    ),
+                    (tx, ty),
                     font,
-                    1.4,
-                    color,
-                    2,
-                    cv2.LINE_AA,
+                    fs,
+                    (0, 0, 255),
+                    thick
                 )
-    return img
+    return result
 
+def overlay_solution_on_original(original_img, solved_warped, pts, size=450):
+    src = np.float32([
+        [0, 0],
+        [size - 1, 0],
+        [size - 1, size - 1],
+        [0, size - 1]
+    ])
+    dst = order_points(pts)
+    M_inv = cv2.getPerspectiveTransform(src, dst)
+    h, w = original_img.shape[:2]
+    warped_back = cv2.warpPerspective(solved_warped, M_inv, (w, h))
+    mask = np.zeros((size, size), dtype=np.uint8)
+    mask[:] = 255
+    mask_warped = cv2.warpPerspective(mask, M_inv, (w, h))
+    result = original_img.copy()
+    mask_3ch = cv2.cvtColor(mask_warped, cv2.COLOR_GRAY2BGR)
+    result = np.where(mask_3ch > 0, warped_back, result)
+    return result
 
-def render_html(grid, original=None, uncertain=None, corrected=None, confidence=None, title=""):
-    uncertain = uncertain or set()
-    corrected = corrected or set()
-    css = """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;700&display=swap');
-    .sw{display:flex;flex-direction:column;align-items:center; font-family:'Poppins',sans-serif;padding:10px}
-    .stitle{font-size:18px;font-weight:700;color:#1a237e;margin-bottom:12px}
-    .sb{border-collapse:collapse;border:4px solid #1a237e; border-radius:8px;overflow:hidden; box-shadow:0 8px 32px rgba(26,35,126,.18);background:#fff}
-    .sb td{width:52px;height:52px;text-align:center;vertical-align:middle; font-size:26px;font-weight:700;border:1px solid #cfd8dc; transition:background .15s;position:relative;cursor:default}
-    .sb td:hover{background:#fff9c4!important}
-    .sb td.br{border-right:3px solid #1a237e!important}
-    .sb td.bb{border-bottom:3px solid #1a237e!important}
-    .sb td.bl{border-left:3px solid #1a237e!important}
-    .sb td.bt{border-top:3px solid #1a237e!important}
-    .sb td.orig{color:#1a237e;background:#e8eaf6}
-    .sb td.solved{color:#1b5e20;background:#e8f5e9}
-    .sb td.empty{color:#e0e0e0;background:#fafafa}
-    .sb td.unc{color:#e65100!important;background:#fff3e0!important; animation:pulse 1.5s infinite}
-    .sb td.fix{color:#6a1b9a!important;background:#f3e5f5!important}
-    .sb td.shd{background:#f3f0ff}
-    .sb td.shd.orig{background:#e0dcf7}
-    .sb td.shd.solved{background:#d7f0d9}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
-    .sb td .cf{position:absolute;bottom:1px;right:2px; font-size:7px;color:#999;font-weight:400}
-    .lg{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;font-size:11px;color:#555}
-    .li{display:flex;align-items:center;gap:4px}
-    .lb{width:16px;height:16px;border-radius:3px;border:1px solid #bbb}
-    </style>
-    """
-    h = css + '<div class="sw">'
-    if title:
-        h += f'<div class="stitle">{title}</div>'
-    h += '<table class="sb">'
-    for r in range(9):
-        h += "<tr>"
-        for c in range(9):
-            v = int(grid[r][c])
-            cl = []
-            if c % 3 == 0 and c:
-                cl.append("bl")
-            if c % 3 == 2 and c < 8:
-                cl.append("br")
-            if r % 3 == 0 and r:
-                cl.append("bt")
-            if r % 3 == 2 and r < 8:
-                cl.append("bb")
-            if (r // 3 + c // 3) % 2 == 0:
-                cl.append("shd")
-            if (r, c) in corrected:
-                cl.append("fix")
-            elif (r, c) in uncertain:
-                cl.append("unc")
-            elif v == 0:
-                cl.append("empty")
-            elif original and int(original[r][c]):
-                cl.append("orig")
+# ==========================================
+# 5. مكونات الواجهة (محسّنة)
+# ==========================================
+def show_confidence_board(board, confidences):
+    """عرض اللوحة المكتشفة بألوان حسب الثقة"""
+    html = """<table style='border-collapse:collapse; margin:auto; font-family:monospace;'>"""
+    for i in range(9):
+        html += "<tr>"
+        for j in range(9):
+            val = board[i][j]
+            conf = confidences[i][j]
+            if val == 0:
+                bg = "#f5f5f5"
+                text = ""
+            elif conf > 0.95:
+                bg = "#c8e6c9"
+                text = str(val)
+            elif conf > 0.80:
+                bg = "#fff9c4"
+                text = str(val)
             else:
-                cl.append("solved")
-
-            txt = str(v) if v else ""
-            cf = ""
-            if confidence and v and confidence[r][c] < 1.5:
-                cf = f'<span class="cf">{confidence[r][c]:.0%}</span>'
-            h += f'<td class="{" ".join(cl)}">{txt}{cf}</td>'
-        h += "</tr>"
-    h += "</table>"
-    h += """
-    <div class="lg">
-        <div class="li"><div class="lb" style="background:#e8eaf6"></div> <b style="color:#1a237e">أصلي</b></div>
-        <div class="li"><div class="lb" style="background:#e8f5e9"></div> <b style="color:#1b5e20">محلول</b></div>
-        <div class="li"><div class="lb" style="background:#fff3e0"></div> <b style="color:#e65100">⚠️ مشكوك</b></div>
-        <div class="li"><div class="lb" style="background:#f3e5f5"></div> <b style="color:#6a1b9a">🔧 مُصحّح</b></div>
-    </div></div>"""
-    return h
-
-
-# ══════════════════════════════════════════════════════════════
-# 8 · أدوات مساعدة
-# ══════════════════════════════════════════════════════════════
-def safe_rerun():
-    try:
-        st.rerun()
-    except AttributeError:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
-
-
-def _clear_form_keys():
-    """حذف مفاتيح حقول الشبكة من session لتحديث القيم."""
-    for r in range(9):
-        for c in range(9):
-            k = f"sc_{r}_{c}"
-            if k in st.session_state:
-                del st.session_state[k]
-
-
-def _init_state():
-    for k, v in DEFAULTS.items():
-        if k not in st.session_state:
-            # النسخ لتجنب المراجع المشتركة
-            if isinstance(v, (list, dict, set)):
-                st.session_state[k] = copy.deepcopy(v)
-            else:
-                st.session_state[k] = v
-
-
-def _reset_state(**overrides):
-    for k, v in DEFAULTS.items():
-        if isinstance(v, (list, dict, set)):
-            st.session_state[k] = copy.deepcopy(v)
-        else:
-            st.session_state[k] = v
-    for k, v in overrides.items():
-        st.session_state[k] = v
-    _clear_form_keys()
-
-
-# ══════════════════════════════════════════════════════════════
-# 9 · الواجهة الرئيسية
-# ══════════════════════════════════════════════════════════════
-
-# ─── CSS عام ───
-st.markdown(
-    """
-<style>
-.block-container{max-width:820px}
-div[data-testid="stForm"]{
-    border:4px solid #1a237e!important;
-    border-radius:14px!important;
-    padding:22px 18px!important;
-    background:linear-gradient(145deg,#f8f9ff,#eef0ff)!important;
-    box-shadow:0 6px 24px rgba(26,35,126,.12)!important}
-div[data-testid="stForm"] input[type="text"]{
-    text-align:center!important;font-size:26px!important;
-    font-weight:800!important;color:#1a237e!important;
-    height:54px!important;border:1.5px solid #b0bec5!important;
-    border-radius:6px!important;padding:0!important;
-    background:#fff!important;transition:all .15s!important}
-div[data-testid="stForm"] input[type="text"]:focus{
-    border-color:#1565c0!important;
-    box-shadow:0 0 0 3px rgba(21,101,192,.25)!important;
-    background:#e3f2fd!important}
-div[data-testid="stForm"] input[type="text"]::placeholder{
-    color:#d0d0d0!important;font-size:20px!important}
-.block-divider{border:none;height:4px;
-    background:linear-gradient(90deg,transparent,#1a237e,transparent);
-    margin:5px 0 7px 0;border-radius:4px}
-</style>""",
-    unsafe_allow_html=True,
-)
-
-# ─── عنوان ───
-st.markdown(
-    """
-<div style="text-align:center;padding:10px 0 5px">
-    <h1 style="color:#1a237e;margin:0">🧩 SudokuSense AI</h1>
-    <p style="color:#666;font-size:15px;margin-top:6px">
-        يستخرج ← يتحقق ← يُصحّح تلقائياً ← يحل
-    </p>
-</div>""",
-    unsafe_allow_html=True,
-)
-
-_init_state()
-
-# ─── تحميل النموذج ───
-model, load_msg = load_ai_model()
-
-# شريط جانبي للمعلومات
-with st.sidebar:
-    st.markdown("### ⚙️ معلومات النظام")
-    st.write(f"**TensorFlow:** `{TF_VERSION}`")
-    st.write(f"**النموذج:** {'✅ جاهز' if model else '❌ غير متاح'}")
-    if model:
-        st.write(f"**طريقة التحميل:** {load_msg}")
-    else:
-        with st.expander("تفاصيل الخطأ"):
-            st.code(load_msg)
-    st.write(f"**processing:** {'✅' if main_processing else '⛔ بديل داخلي'}")
-    st.write(f"**solver:** {'✅' if mainSolver else '⛔ backtracking'}")
-    st.markdown("---")
-    st.markdown("### 📖 الألوان")
-    st.markdown(
-        """
-    - 🔵 **أزرق** = رقم أصلي
-    - 🟢 **أخضر** = رقم محلول
-    - 🟠 **برتقالي** = مشكوك فيه
-    - 🟣 **بنفسجي** = تصحيح تلقائي
-    """
-    )
-
-# ═══════════════════════════════════════════
-# التبويبات
-# ═══════════════════════════════════════════
-tab_img, tab_manual = st.tabs(["📷 استخراج من صورة", "✏️ إدخال يدوي"])
-
-# ─── تبويب الصورة ───
-with tab_img:
-    uploaded = st.file_uploader(
-        "ارفع صورة سودوكو",
-        type=["jpg", "jpeg", "png", "bmp", "webp"],
-    )
-    if uploaded:
-        pil = Image.open(uploaded).convert("RGB")
-        st.image(pil, caption="الصورة المرفوعة", width=320)
-
-        if model is None:
-            st.error("❌ النموذج غير متاح — راجع الشريط الجانبي")
-        else:
-            conf_thresh = st.slider(
-                "🎚️ حد الثقة (كلما ↑ = فحص أدق)",
-                0.50,
-                0.95,
-                0.75,
-                0.05,
+                bg = "#ffcdd2"
+                text = f"{val}?"
+            # حدود المربعات 3×3
+            bt = "3px solid #000" if i % 3 == 0 else "1px solid #aaa"
+            bl = "3px solid #000" if j % 3 == 0 else "1px solid #aaa"
+            bb = "3px solid #000" if i == 8 else ""
+            br = "3px solid #000" if j == 8 else ""
+            style = (
+                f"width:46px; height:46px; text-align:center; "
+                f"font-size:20px; font-weight:bold; background:{bg}; "
+                f"border-top:{bt}; border-left:{bl};"
             )
-            if st.button(
-                "🔍 استخراج وتصحيح تلقائي",
-                type="primary",
-                use_container_width=True,
-                key="btn_extract",
-            ):
-                cv_img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            if bb:
+                style += f" border-bottom:{bb};"
+            if br:
+                style += f" border-right:{br};"
+            html += f"<td style='{style}'>{text}</td>"
+        html += "</tr>"
+    html += "</table>"
+    html += """
+    <div style='text-align:center; margin-top:12px; font-size:13px;'>
+        <span style='background:#c8e6c9; padding:3px 10px; border-radius:4px; margin:0 3px;'>🟢 ثقة عالية &gt;95%</span>
+        <span style='background:#fff9c4; padding:3px 10px; border-radius:4px; margin:0 3px;'>🟡 متوسطة &gt;80%</span>
+        <span style='background:#ffcdd2; padding:3px 10px; border-radius:4px; margin:0 3px;'>🔴 منخفضة &lt;80%</span>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
-                with st.status("جاري المعالجة …", expanded=True) as status:
-                    # 1 — ثنائية
-                    st.write("🔍 معالجة الصورة …")
-                    binary = binarize(cv_img)
-
-                    # 2 — إيجاد الشبكة
-                    contour = find_grid_contour(binary)
-                    if contour is None:
-                        status.update(label="❌ فشل", state="error")
-                        st.error("لم يُعثر على شبكة سودوكو")
-                        st.stop()
-
-                    # 3 — تقسيم الخلايا
-                    st.write("✂️ تقسيم الشبكة …")
-                    if main_processing is not None:
-                        try:
-                            ok, imgs, _ = main_processing(contour, binary)
-                        except Exception as e:
-                            st.warning(
-                                f"⚠️ main_processing فشل: {e} — سيُستخدم البديل الداخلي"
-                            )
-                            ok, imgs, _ = split_grid_into_cells(binary, contour)
-                    else:
-                        ok, imgs, _ = split_grid_into_cells(binary, contour)
-
-                    if not ok:
-                        status.update(label="❌ فشل", state="error")
-                        st.error("فشل تقسيم الشبكة")
-                        st.stop()
-
-                    # 4 — قراءة الأرقام
-                    st.write("🤖 قراءة الأرقام (TTA) …")
-                    g, cf, al, unc = recognize_with_confidence(imgs, model, conf_thresh)
-
-                    # 5 — تصحيح تلقائي
-                    conflicts = find_conflicts(g)
-                    st.write(f"🔎 تعارضات: **{len(conflicts)}**")
-                    corr = []
-                    if conflicts:
-                        st.write("🔧 تصحيح تلقائي …")
-                        g, corr = auto_correct(g, cf, al)
-                        st.write(
-                            f"✅ تصحيحات: **{len(corr)}** — متبقي: **{len(find_conflicts(g))}**"
-                        )
-
-                    # حفظ
-                    st.session_state.grid = g
-                    st.session_state.original = copy.deepcopy(g)
-                    st.session_state.confidence = cf
-                    st.session_state.alternatives = al
-                    st.session_state.uncertain = unc
-                    st.session_state.corrections = corr
-                    st.session_state.solved = None
-                    _clear_form_keys()
-
-                    status.update(label="✅ اكتمل!", state="complete")
-
-                if corr:
-                    with st.expander("🔧 تفاصيل التصحيحات", expanded=True):
-                        for f in corr:
-                            st.write(
-                                f"📍 ص{f['row']+1} ع{f['col']+1}: "
-                                f"**{f['old']}** → **{f['new']}** "
-                                f"({f['old_conf']:.0%} → {f['new_conf']:.0%})"
-                            )
-                safe_rerun()
-
-# ─── تبويب الإدخال اليدوي ───
-with tab_manual:
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("📝 شبكة فارغة", use_container_width=True, key="btn_empty"):
-            empty = [[0] * 9 for _ in range(9)]
-            _reset_state(grid=empty, original=copy.deepcopy(empty))
-            safe_rerun()
-    with c2:
-        if st.button("🧪 مثال تجريبي", use_container_width=True, key="btn_example"):
-            ex = [
-                [5, 3, 0, 0, 7, 0, 0, 0, 0],
-                [6, 0, 0, 1, 9, 5, 0, 0, 0],
-                [0, 9, 8, 0, 0, 0, 0, 6, 0],
-                [8, 0, 0, 0, 6, 0, 0, 0, 3],
-                [4, 0, 0, 8, 0, 3, 0, 0, 1],
-                [7, 0, 0, 0, 2, 0, 0, 0, 6],
-                [0, 6, 0, 0, 0, 0, 2, 8, 0],
-                [0, 0, 0, 4, 1, 9, 0, 0, 5],
-                [0, 0, 0, 0, 8, 0, 0, 7, 9],
-            ]
-            _reset_state(grid=ex, original=copy.deepcopy(ex))
-            safe_rerun()
-
-    with st.expander("📋 لصق أرقام من نص"):
-        txt = st.text_area(
-            "9 أسطر — كل سطر 9 أرقام (0 = فارغ)",
-            height=200,
-            placeholder="530070000\n600195000\n098000060\n"
-            "800060003\n400803001\n700020006\n"
-            "060000280\n000419005\n000080079",
+def get_download_button(img, filename="sudoku_solved.png"):
+    """زر تحميل الصورة المحلولة"""
+    success, buffer = cv2.imencode('.png', img)
+    if success:
+        st.download_button(
+            label="📥 تحميل الحل كصورة PNG",
+            data=BytesIO(buffer.tobytes()),
+            file_name=filename,
+            mime="image/png",
+            use_container_width=True
         )
-        if st.button("⬇️ تحميل", key="btn_paste"):
-            lines = [l.strip() for l in txt.strip().splitlines() if l.strip()]
-            if len(lines) != 9:
-                st.error("❌ يجب إدخال 9 أسطر بالضبط")
-            else:
-                g = []
-                ok = True
-                for line in lines:
-                    ds = [
-                        int(ch)
-                        for ch in line.replace(" ", "").replace(",", "")
-                        if ch.isdigit()
-                    ]
-                    if len(ds) != 9:
-                        st.error(f"❌ «{line}» لا يحتوي 9 أرقام")
-                        ok = False
-                        break
-                    g.append(ds)
-                if ok:
-                    _reset_state(grid=g, original=copy.deepcopy(g))
-                    safe_rerun()
 
-# ═══════════════════════════════════════════
-# محرر الشبكة التفاعلي
-# ═══════════════════════════════════════════
-if st.session_state.grid is not None:
-    st.markdown("---")
+def save_history(original, solved):
+    """حفظ اللغز في السجل"""
+    st.session_state.history.append({
+        'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'clues': int(np.count_nonzero(original)),
+        'original': original.copy(),
+        'solved': solved.copy(),
+    })
 
-    # معاينة HTML
-    corr_set = {(f["row"], f["col"]) for f in st.session_state.corrections}
-    preview = render_html(
-        st.session_state.grid,
-        title="الشبكة الحالية",
-        uncertain=st.session_state.uncertain,
-        corrected=corr_set,
-        confidence=st.session_state.confidence,
+def show_history():
+    """عرض سجل الألغاز المحلولة"""
+    if not st.session_state.history:
+        st.caption("لا توجد ألغاز محلولة بعد")
+        return
+    for idx, entry in enumerate(reversed(st.session_state.history)):
+        num = len(st.session_state.history) - idx
+        with st.expander(
+            f"🧩 لغز #{num} — {entry['time']} "
+            f"({entry['clues']} أرقام)"
+        ):
+            sol_df = pd.DataFrame(
+                entry['solved'],
+                columns=[f"C{i+1}" for i in range(9)],
+                index=[f"R{i+1}" for i in range(9)]
+            )
+            st.dataframe(sol_df, use_container_width=True)
+    if st.button("🗑️ مسح السجل"):
+        st.session_state.history = []
+        st.rerun()
+
+def reset_state():
+    """إعادة تعيين الحالة للصورة الجديدة"""
+    st.session_state.update({
+        'img_hash': None,
+        'board_extracted': False,
+        'extracted_board': None,
+        'confidences': None,
+        'solved_img': None,
+        'solved_board': None,
+        'debug_clean': None,
+        'warped_img': None,
+        'original_img': None,
+        'pts': None,
+    })
+
+# ==========================================
+# ██ واجهة التطبيق الرئيسية ██
+# ==========================================
+st.title("🤖 حلّال السودوكو الذكي النهائي")
+st.caption(
+    "CNN + Multi-Threshold + TTA + Batch Prediction + Hough Fallback"
+)
+
+# ═══════════ الشريط الجانبي ═══════════
+with st.sidebar:
+    st.header("⚙️ الإعدادات")
+    use_tta = st.checkbox(
+        "🔄 Test-Time Augmentation",
+        value=True,
+        help="يزيد دقة التعرف عبر إنشاء نسخ معدّلة من كل خلية"
     )
-    components.html(preview, height=560, scrolling=False)
-
-    st.markdown(
-        '<p style="text-align:center;color:#5c6bc0;font-weight:600;margin:10px 0 5px">'
-        '⬇️ عدّل الأرقام ثم اضغط <b>🚀 حل</b></p>',
-        unsafe_allow_html=True,
+    conf_threshold = st.slider(
+        "🎯 حد الثقة الأدنى",
+        min_value=0.50,
+        max_value=0.99,
+        value=0.70,
+        step=0.05,
+        help="الأرقام بثقة أقل من هذا الحد تُعتبر فارغة"
     )
+    st.divider()
+    st.header("📜 سجل الألغاز")
+    show_history()
 
-    # ─── بناء النموذج (Form) ───
-    edited = [[0] * 9 for _ in range(9)]
-    action = None  # "solve" | "reset" | "clear"
-
-    with st.form("sudoku_form", clear_on_submit=False):
-        for brow in range(3):
-            for lrow in range(3):
-                row = brow * 3 + lrow
-                # 9 خلايا + 2 فاصل رفيع
-                widths = [1, 1, 1, 0.15, 1, 1, 1, 0.15, 1, 1, 1]
-                cols = st.columns(widths, gap="small")
-                idx_map = [0, 1, 2, 4, 5, 6, 8, 9, 10]
-                for c in range(9):
-                    with cols[idx_map[c]]:
-                        v = st.session_state.grid[row][c]
-                        disp = str(v) if v else ""
-                        res = st.text_input(
-                            label=f"R{row}C{c}",
-                            value=disp,
-                            key=f"sc_{row}_{c}",
-                            max_chars=1,
-                            label_visibility="collapsed",
-                            placeholder="·",
-                        )
-                        if res and res.strip().isdigit():
-                            d = int(res.strip())
-                            edited[row][c] = d if 1 <= d <= 9 else 0
-            if brow < 2:
-                st.markdown('<hr class="block-divider">', unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            if st.form_submit_button("🚀 حل السودوكو", type="primary", use_container_width=True):
-                action = "solve"
-        with b2:
-            if st.form_submit_button("🔄 إعادة تعيين", use_container_width=True):
-                action = "reset"
-        with b3:
-            if st.form_submit_button("🗑️ مسح الكل", use_container_width=True):
-                action = "clear"
-
-    # ─── معالجة الأزرار (خارج الـ Form) ───
-    if action == "solve":
-        # التحقق
-        valid = all(0 <= edited[r][c] <= 9 for r in range(9) for c in range(9))
-        if not valid:
-            st.error("❌ قيم غير صالحة (0-9 فقط)")
-        else:
-            st.session_state.grid = edited
-            st.session_state.original = copy.deepcopy(edited)
-            t0 = time.time()
-            with st.spinner("⚙️ جاري الحل …"):
-                result = solve_puzzle(edited)
-                elapsed = time.time() - t0
-            if result:
-                st.session_state.solved = result
-                _clear_form_keys()
-                st.toast(f"⏱️ تم الحل في {elapsed:.2f} ثانية", icon="✅")
-                safe_rerun()
-            else:
-                st.error("❌ الشبكة غير قابلة للحل! تحقق من الأرقام المدخلة.")
-    elif action == "reset":
-        st.session_state.grid = copy.deepcopy(
-            st.session_state.original or [[0] * 9 for _ in range(9)]
-        )
-        st.session_state.solved = None
-        _clear_form_keys()
-        safe_rerun()
-    elif action == "clear":
-        _reset_state()
-        safe_rerun()
-
-# ═══════════════════════════════════════════
-# عرض النتيجة النهائية
-# ═══════════════════════════════════════════
-if st.session_state.solved is not None:
-    st.markdown("---")
-    st.subheader("✅ الحل النهائي")
-    solved_html = render_html(
-        st.session_state.solved,
-        st.session_state.original,
-        title="🎉 تم الحل بنجاح!",
+# ═══════════ تحميل النموذج ═══════════
+model = load_digit_model()
+if model is None:
+    st.error("⚠️ ملف model.h5 مفقود أو تالف!")
+    st.info(
+        "ضع ملف `model.h5` (نموذج CNN مدرّب على MNIST) "
+        "في نفس مجلد التطبيق."
     )
-    components.html(solved_html, height=580, scrolling=False)
+    st.stop()
+st.success("✅ النموذج جاهز للعمل")
 
-    # تصدير كنص
-    with st.expander("📊 عرض الحل كنص"):
-        txt_lines = []
-        for r in range(9):
-            row_str = " ".join(str(st.session_state.solved[r][c]) for c in range(9))
-            txt_lines.append(row_str)
-            if r % 3 == 2 and r < 8:
-                txt_lines.append("─" * 17)
-        st.code("\n".join(txt_lines))
+# ═══════════ اختيار طريقة الإدخال ═══════════
+input_mode = st.radio(
+    "📥 طريقة الإدخال:",
+    ("📸 كاميرا", "📁 ملف صورة / PDF", "⌨️ إدخال يدوي"),
+    horizontal=True
+)
 
-    # تحميل صورة
-    result_img = draw_sudoku_image(st.session_state.solved, st.session_state.original)
-    _, enc = cv2.imencode(".png", result_img)
-    st.download_button(
-        "📥 تحميل صورة الحل (PNG)",
-        data=enc.tobytes(),
-        file_name="sudoku_solved.png",
-        mime="image/png",
+# ╔══════════════════════════════════════════╗
+# ║ الوضع اليدوي ║
+# ╚══════════════════════════════════════════╝
+if input_mode == "⌨️ إدخال يدوي":
+    st.subheader("⌨️ أدخل أرقام السودوكو يدوياً")
+    st.info("ضع **0** في الخلايا الفارغة")
+    empty_board = np.zeros((9, 9), dtype=int)
+    df = pd.DataFrame(
+        empty_board,
+        columns=[f"C{i+1}" for i in range(9)],
+        index=[f"R{i+1}" for i in range(9)]
+    )
+    edited_df = st.data_editor(
+        df,
         use_container_width=True,
+        key="manual_input"
     )
+    if st.button(
+        "🚀 حل السودوكو",
+        type="primary",
+        use_container_width=True
+    ):
+        final_board = edited_df.to_numpy().astype(int)
+        ok, msg = validate_board(final_board)
+        if not ok:
+            st.error(f"❌ {msg}")
+        else:
+            clue_count = np.count_nonzero(final_board)
+            if clue_count < 17:
+                st.warning(
+                    f"⚠️ عدد الأرقام المُعطاة ({clue_count}) قليل جداً. "
+                    f"الحد الأدنى النظري 17."
+                )
+            s_board = final_board.copy()
+            original_board = final_board.copy()
+            with st.spinner("⏳ جاري الحل..."):
+                start = time.time()
+                if solve(s_board):
+                    elapsed = time.time() - start
+                    st.success(f"✅ تم الحل في {elapsed:.2f} ثانية!")
+                    st.balloons()
+                    sol_df = pd.DataFrame(
+                        s_board,
+                        columns=[f"C{i+1}" for i in range(9)],
+                        index=[f"R{i+1}" for i in range(9)]
+                    )
+                    st.dataframe(sol_df, use_container_width=True)
+                    save_history(original_board, s_board)
+                else:
+                    st.error(
+                        "❌ لا يمكن حل هذا اللغز! "
+                        "تأكد من صحة الأرقام."
+                    )
 
-    st.balloons()
-    st.success("🎉 تم حل السودوكو بنجاح!")
+# ╔══════════════════════════════════════════╗
+# ║ وضع الكاميرا أو الملف ║
+# ╚══════════════════════════════════════════╝
+else:
+    if input_mode == "📸 كاميرا":
+        upload = st.camera_input("📸 صوّر لغز السودوكو")
+    else:
+        upload = st.file_uploader(
+            "📁 ارفع صورة أو ملف PDF",
+            type=['png', 'jpg', 'jpeg', 'bmp', 'webp', 'pdf']
+        )
+
+    if upload:
+        data = upload.getvalue()
+        filename = getattr(upload, 'name', 'photo.jpg').lower()
+
+        # ── قراءة الصورة ──
+        if filename.endswith('.pdf'):
+            try:
+                doc = fitz.open(stream=data, filetype="pdf")
+                pix = doc[0].get_pixmap(dpi=200)
+                img = cv2.imdecode(
+                    np.frombuffer(pix.tobytes("png"), np.uint8),
+                    1
+                )
+                doc.close()
+            except Exception as e:
+                st.error(f"❌ خطأ في قراءة PDF: {e}")
+                st.stop()
+        else:
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), 1)
+
+        if img is None:
+            st.error("❌ فشل في قراءة الصورة!")
+            st.stop()
+
+        # ── ضبط الحجم ──
+        img = resize_if_needed(img)
+
+        # ── عرض الصورة الأصلية ──
+        st.subheader("📷 الصورة الأصلية")
+        st.image(img, channels="BGR", use_container_width=True)
+
+        # ── التحقق من تغيير الصورة ──
+        h_val = hashlib.md5(img.tobytes()[:5000]).hexdigest()
+        if st.session_state.img_hash != h_val:
+            st.session_state.update({
+                'img_hash': h_val,
+                'board_extracted': False,
+                'extracted_board': None,
+                'confidences': None,
+                'solved_img': None,
+                'solved_board': None,
+                'debug_clean': None,
+                'warped_img': None,
+                'original_img': img.copy(),
+                'pts': None,
+            })
+
+        # ══════════════════════════════════════
+        # اكتشاف الشبكة (محسّن + Hough)
+        # ══════════════════════════════════════
+        with st.spinner("🔍 البحث عن شبكة السودوكو..."):
+            pts, thresh = find_board_robust(img)
+
+        if pts is None:
+            st.error("❌ لم يتم العثور على شبكة سودوكو!")
+            st.info(
+                "💡 نصائح:\n"
+                "- تأكد أن الصورة تحتوي شبكة كاملة واضحة\n"
+                "- حسّن الإضاءة وزاوية التصوير\n"
+                "- جرّب الاقتراب أكثر من اللغز"
+            )
+            st.stop()
+
+        st.session_state.pts = pts
+        warped, M = warp_image(img, pts)
+        st.session_state.warped_img = warped.copy()
+        st.subheader("🔲 الشبكة المكتشفة")
+        st.image(warped, channels="BGR", use_container_width=True)
+
+        # ══════════════════════════════════════
+        # استخراج الأرقام
+        # ══════════════════════════════════════
+        if not st.session_state.board_extracted:
+            board, confidences = extract_digits_batch(
+                warped,
+                model,
+                use_tta=use_tta,
+                conf_threshold=conf_threshold
+            )
+            st.session_state.extracted_board = board.copy()
+            st.session_state.confidences = confidences.copy()
+            st.session_state.board_extracted = True
+
+            detected = int(np.count_nonzero(board))
+            avg_conf = (
+                float(np.mean(confidences[confidences > 0]))
+                if detected > 0 else 0
+            )
+            st.info(
+                f"🔢 تم اكتشاف **{detected}** رقم | "
+                f"متوسط الثقة **{avg_conf:.1%}**"
+            )
+
+        # ══════════════════════════════════════
+        # عرض اللوحة المكتشفة
+        # ══════════════════════════════════════
+        if st.session_state.board_extracted:
+            st.subheader("🔢 اللوحة المكتشفة (ملونة حسب الثقة)")
+            show_confidence_board(
+                st.session_state.extracted_board,
+                st.session_state.confidences
+            )
+            st.markdown("---")
+
+            b = st.session_state.extracted_board.copy()
+            ok, msg = validate_board(b)
+            if not ok:
+                st.warning(f"⚠️ {msg}")
+                st.info("👇 عدّل الأرقام الخاطئة في الجدول أدناه")
+
+            # ── جدول قابل للتعديل ──
+            st.subheader("✏️ تعديل الأرقام (اختياري)")
+            df = pd.DataFrame(
+                b,
+                columns=[f"C{i+1}" for i in range(9)],
+                index=[f"R{i+1}" for i in range(9)]
+            )
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                key="board_editor"
+            )
+
+            # ── زر الحل ──
+            if st.button(
+                "🚀 حل السودوكو",
+                type="primary",
+                use_container_width=True
+            ):
+                final_board = edited_df.to_numpy().astype(int)
+                ok2, msg2 = validate_board(final_board)
+                if not ok2:
+                    st.error(f"❌ {msg2}")
+                else:
+                    clue_count = np.count_nonzero(final_board)
+                    if clue_count < 17:
+                        st.warning(
+                            f"⚠️ عدد الأرقام ({clue_count}) قليل جداً"
+                        )
+                    s_board = final_board.copy()
+                    original_board = final_board.copy()
+                    with st.spinner("⏳ جاري الحل..."):
+                        start_t = time.time()
+                        solved = solve(s_board)
+                        elapsed_t = time.time() - start_t
+                        if solved:
+                            st.success(
+                                f"✅ تم الحل بنجاح في {elapsed_t:.2f} ثانية!"
+                            )
+                            st.balloons()
+                            st.session_state.solved_board = s_board.copy()
+
+                            # رسم الحل
+                            solved_warped = draw_solution_on_warped(
+                                st.session_state.warped_img.copy(),
+                                s_board,
+                                original_board
+                            )
+                            result = overlay_solution_on_original(
+                                img,
+                                solved_warped,
+                                st.session_state.pts
+                            )
+                            st.session_state.solved_img = result
+                            save_history(original_board, s_board)
+                        else:
+                            st.error(
+                                "❌ لا يمكن حل هذا اللغز! "
+                                "تأكد من صحة الأرقام المدخلة."
+                            )
+
+            # ══════════════════════════════════════
+            # عرض النتيجة النهائية
+            # ══════════════════════════════════════
+            if st.session_state.solved_img is not None:
+                st.markdown("---")
+                st.subheader("🎯 النتيجة النهائية")
+
+                # مقارنة قبل / بعد
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(
+                        img,
+                        channels="BGR",
+                        caption="📷 قبل الحل",
+                        use_container_width=True
+                    )
+                with col2:
+                    st.image(
+                        st.session_state.solved_img,
+                        channels="BGR",
+                        caption="✅ بعد الحل",
+                        use_container_width=True
+                    )
+
+                # زر التحميل
+                get_download_button(st.session_state.solved_img)
+
+                # الحل كجدول
+                if st.session_state.solved_board is not None:
+                    with st.expander("📊 عرض الحل كجدول"):
+                        sol_df = pd.DataFrame(
+                            st.session_state.solved_board,
+                            columns=[f"C{i+1}" for i in range(9)],
+                            index=[f"R{i+1}" for i in range(9)]
+                        )
+                        st.dataframe(sol_df, use_container_width=True)
+
+            # ══════════════════════════════════════
+            # المعاينة التقنية
+            # ══════════════════════════════════════
+            if st.session_state.debug_clean is not None:
+                with st.expander("🛠️ المعاينة التقنية (Debug)"):
+                    st.image(
+                        st.session_state.debug_clean,
+                        caption="الأرقام كما رآها الذكاء الاصطناعي (28×28)",
+                        use_container_width=True
+                    )
+                    if st.session_state.confidences is not None:
+                        conf = st.session_state.confidences
+                        non_zero = conf[conf > 0]
+                        if len(non_zero) > 0:
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("أعلى ثقة", f"{non_zero.max():.1%}")
+                            c2.metric("أقل ثقة", f"{non_zero.min():.1%}")
+                            c3.metric("المتوسط", f"{non_zero.mean():.1%}")
